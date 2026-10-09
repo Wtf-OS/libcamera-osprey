@@ -294,4 +294,17 @@ controls:
         Currently identical to ANDROID_STATISTICS_FACE_IDS.
       size: [n]
 
+  - OspreyFlashMode:
+      type: int32_t
+      direction: in
+      description: |
+        Experimental SKY81296 mode: 0 off, 1 single flash, 2 torch, 3 auto.
+        Only advertised on the Osprey rear camera with a writable flash LED.
+
+  - OspreyFlashFired:
+      type: bool
+      direction: out
+      description: |
+        True when the selected frame was captured within the flash interval.
+
 ...

@@ -29,12 +29,17 @@
 #include <libcamera/color_space.h>
 #include <libcamera/control_ids.h>
 #include <libcamera/geometry.h>
+#include <libcamera/formats.h>
 #include <libcamera/pixel_format.h>
 #include <libcamera/stream.h>
 
 #include "libcamera/internal/camera.h"
 #include "libcamera/internal/camera_manager.h"
 #include "libcamera/internal/camera_sensor.h"
+#include "libcamera/internal/camera_lens.h"
+#include "libcamera/internal/mapped_framebuffer.h"
+#include "libcamera/internal/osprey_flash.h"
+#include <time.h>
 #include "libcamera/internal/camera_sensor_properties.h"
 #include "libcamera/internal/converter.h"
 #include "libcamera/internal/delayed_controls.h"
@@ -198,6 +203,7 @@ struct SimpleFrameInfo {
 	Request *request;
 	bool metadataRequired;
 	bool metadataProcessed;
+	ControlList sensorControls;
 };
 
 class SimpleFrames
@@ -360,6 +366,21 @@ public:
 	std::unique_ptr<Converter> converter_;
 	std::unique_ptr<SoftwareIsp> swIsp_;
 	SimpleFrames frameInfo_;
+	void addFocusControls();
+	void focusControls(const ControlList &controls);
+	Rectangle focusWindow_;
+    uint32_t flashSequence_ = UINT32_MAX;
+    uint64_t flashStart_ = 0;
+    bool flashTorch_ = false;
+	int focusMode_ = controls::AfModeAuto;
+	int focusState_ = controls::AfStateIdle;
+	int focusScanPosition_ = -1;
+	uint64_t focusValidAfter_ = 0;
+    int focusStep_ = 64;
+    int focusEnd_ = 480;
+    bool focusSettling_ = false;
+	int focusBestPosition_ = 0;
+	double focusBestScore_ = -1;
 
 private:
 	void tryPipeline(unsigned int code, const Size &size);
@@ -368,6 +389,9 @@ private:
 	void tryCompleteRequest(Request *request);
 	void conversionInputDone(FrameBuffer *buffer);
 	void conversionOutputDone(FrameBuffer *buffer);
+	void focusBuffer(FrameBuffer *buffer);
+
+
 
 	void ispStatsReady(uint32_t frame, uint32_t bufferId);
 	void metadataReady(uint32_t frame, const ControlList &metadata);
@@ -662,6 +686,7 @@ int SimpleCameraData::init()
 			formats_[fmt].push_back(&config);
 	}
 
+	addFocusControls();
 	properties_ = sensor_->properties();
 
 	/* Find the first subdev that can generate a frame start signal, if any. */
@@ -939,6 +964,68 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
 		}
 	}
 
+    if (request && !rawStream_ && ospreyFlashAvailable(sensor_->id())) {
+        const int mode = request->controls().get(controls::draft::OspreyFlashMode).value_or(0);
+        bool autoFlash = false;
+        if (mode == 3) {
+            const uint32_t ids[] = {V4L2_CID_EXPOSURE, V4L2_CID_ANALOGUE_GAIN};
+            const ControlList values = sensor_->getControls(ids);
+            IPACameraSensorInfo info;
+            if (values.contains(V4L2_CID_EXPOSURE) && values.contains(V4L2_CID_ANALOGUE_GAIN) &&
+                !sensor_->sensorInfo(&info) && info.pixelRate) {
+                const double exposureUs = values.get(V4L2_CID_EXPOSURE).get<int32_t>() *
+                    double(info.minLineLength) * 1000000.0 / info.pixelRate;
+                // S5K3M2 analogue gain is Q5. ponytail: initial 40 ms exposure-load
+                // cutoff; tune against dark/bright scenes before adding a preflash AE loop.
+                const double gain = values.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>() / 32.0;
+                autoFlash = exposureUs * gain > 40000.0;
+            }
+        }
+        if (mode == 1 || autoFlash) {
+            if (flashSequence_ != request->sequence()) {
+                flashSequence_ = request->sequence();
+                flashTorch_ = false;
+                ospreyFlashWrite("brightness", false);
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                flashStart_ = uint64_t(now.tv_sec) * 1000000000ULL + now.tv_nsec;
+                if (ospreyFlashWrite("flash_strobe", true)) {
+                    flashStart_ = 0;
+                }
+                LOG(SimplePipeline, Info) << "Osprey flash trigger sequence="
+                    << request->sequence() << " started=" << flashStart_;
+            }
+            const uint64_t timestamp = buffer->metadata().timestamp;
+            // Free-running internal buffers may predate the trigger. Discard
+            // them, leaving this request at the head of the conversion queue.
+            // ponytail: fixed 100 ms settle; use sensor frame-sync for shorter pulses.
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            const uint64_t nowNs = uint64_t(now.tv_sec) * 1000000000ULL + now.tv_nsec;
+            // A broken sensor timestamp must not keep a capture queued forever.
+            if (flashStart_ && timestamp < flashStart_ + 100000000ULL &&
+                nowNs < flashStart_ + 700000000ULL) {
+                video_->queueBuffer(buffer);
+                return;
+            }
+            const bool fired = flashStart_ && timestamp >= flashStart_ + 100000000ULL &&
+                timestamp < flashStart_ + 700000000ULL;
+            request->_d()->metadata().set(controls::draft::OspreyFlashFired, fired);
+            LOG(SimplePipeline, Info) << "Osprey flash frame sequence="
+                << request->sequence() << " timestamp=" << timestamp
+                << " fired=" << fired;
+            ospreyFlashWrite("flash_strobe", false);
+            flashStart_ = 0;
+        } else {
+            const bool torch = mode == 2;
+            if (torch != flashTorch_) {
+                if (!ospreyFlashWrite("brightness", torch))
+                    flashTorch_ = torch;
+            }
+            request->_d()->metadata().set(controls::draft::OspreyFlashFired, flashTorch_);
+        }
+    }
+
 	if (request)
 		request->_d()->metadata().set(controls::SensorTimestamp,
 					      buffer->metadata().timestamp);
@@ -957,7 +1044,17 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
 
 		if (converter_)
 			converter_->queueBuffers(buffer, conversionQueue_.front().outputs);
-		else
+		else {
+			SimpleFrameInfo *info = frameInfo_.find(request->sequence());
+			ASSERT(info);
+			// Request sequence differs from the free-running sensor sequence.
+			if (frameStartEmitter_) {
+				info->sensorControls = delayedCtrls_->get(buffer->metadata().sequence);
+			} else {
+				// Without frame-start events, controls are applied directly, not queued by sensor frame.
+				const uint32_t ids[] = { V4L2_CID_EXPOSURE, V4L2_CID_ANALOGUE_GAIN };
+				info->sensorControls = sensor_->getControls(ids);
+			}
 			/*
 			 * request->sequence() cannot be retrieved from `buffer' inside
 			 * queueBuffers because unique_ptr's make buffer->request() invalid
@@ -965,6 +1062,7 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
 			 */
 			swIsp_->queueBuffers(request->sequence(), buffer,
 					     conversionQueue_.front().outputs);
+		}
 
 		conversionQueue_.pop();
 		return;
@@ -1014,20 +1112,169 @@ void SimpleCameraData::conversionInputDone(FrameBuffer *buffer)
 	}
 }
 
+/* ponytail: one AF region and single scan; continuous AF requires scene-change
+ * detection and calibrated lens limits. */
+void SimpleCameraData::addFocusControls()
+{
+    ControlInfoMap::Map map(controlInfo_.begin(), controlInfo_.end());
+    if (sensor_->model() == "s5k3m2" || sensor_->model() == "s5k5e2") {
+        const ControlValue modes[] = { int32_t(controls::draft::NoiseReductionModeOff),
+            int32_t(controls::draft::NoiseReductionModeFast),
+            int32_t(controls::draft::NoiseReductionModeHighQuality) };
+        map[&controls::draft::NoiseReductionMode] = ControlInfo(modes, int32_t(controls::draft::NoiseReductionModeFast));
+    }
+    if (ospreyFlashAvailable(sensor_->id())) {
+        map[&controls::draft::OspreyFlashMode] = ControlInfo(0, 3, 0);
+    }
+    if (sensor_->model() == "s5k3m2" && sensor_->focusLens()) {
+        map[&controls::AfMode] = ControlInfo(controls::AfModeManual, controls::AfModeAuto);
+        map[&controls::AfWindows] = ControlInfo(Rectangle{}, Rectangle(sensor_->resolution()));
+        map[&controls::AfTrigger] = ControlInfo(controls::AfTriggerStart, controls::AfTriggerCancel);
+    }
+    controlInfo_ = ControlInfoMap(std::move(map), controls::controls);
+}
+
+void SimpleCameraData::focusControls(const ControlList &ctrls)
+{
+    if (sensor_->model() != "s5k3m2" || !sensor_->focusLens())
+        return;
+    if (auto windows = ctrls.get(controls::AfWindows))
+        focusWindow_ = windows->empty() ? Rectangle{} : (*windows)[0];
+    if (auto mode = ctrls.get(controls::AfMode)) {
+        if (*mode != focusMode_) {
+            focusMode_ = *mode;
+            focusScanPosition_ = -1;
+            focusState_ = controls::AfStateIdle;
+        }
+    }
+    if (auto trigger = ctrls.get(controls::AfTrigger)) {
+        if (*trigger == controls::AfTriggerCancel) {
+            focusScanPosition_ = -1;
+            focusState_ = controls::AfStateIdle;
+        } else if (focusMode_ == controls::AfModeAuto && focusScanPosition_ < 0) {
+            if (sensor_->focusLens()->setFocusPosition(0)) {
+                focusState_ = controls::AfStateFailed;
+                return;
+            }
+            focusScanPosition_ = 0;
+            focusBestPosition_ = 0;
+            focusBestScore_ = -1;
+            focusStep_ = 64;
+            focusEnd_ = 480;
+            focusSettling_ = false;
+            timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            focusValidAfter_ = uint64_t(now.tv_sec) * 1000000000ULL + now.tv_nsec + 150000000ULL;
+            focusState_ = controls::AfStateScanning;
+        }
+    }
+}
+
+void SimpleCameraData::focusBuffer(FrameBuffer *buffer)
+{
+    if (focusScanPosition_ < 0)
+        return;
+    const StreamConfiguration &cfg = streams_[0].configuration();
+    if (cfg.pixelFormat != formats::NV12 ||
+        !buffer->request() || buffer->request()->findBuffer(&streams_[0]) != buffer)
+        return;
+    // Use capture time, not processing time: queued frames predate the lens move.
+    timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const uint64_t nowNs = uint64_t(now.tv_sec) * 1000000000ULL + now.tv_nsec;
+    if (buffer->metadata().timestamp < focusValidAfter_) {
+        if (nowNs > focusValidAfter_ + 2000000000ULL) {
+            focusScanPosition_ = -1;
+            focusState_ = controls::AfStateFailed;
+        }
+        return;
+    }
+    if (focusSettling_) {
+        focusScanPosition_ = -1;
+        focusState_ = focusBestScore_ > 0 ? controls::AfStateFocused : controls::AfStateFailed;
+        LOG(SimplePipeline, Info) << "Osprey focus selected " << focusBestPosition_;
+        return;
+    }
+    MappedFrameBuffer map(buffer, MappedFrameBuffer::MapFlag::Read);
+    if (!map.isValid() || map.planes().empty() ||
+        map.planes()[0].size() < cfg.stride * cfg.size.height)
+        return;
+    const auto y = map.planes()[0];
+    double gradient = 0, light = 0;
+    unsigned int count = 0;
+    unsigned int left = cfg.size.width / 4, top = cfg.size.height / 4;
+    unsigned int right = cfg.size.width * 3 / 4, bottom = cfg.size.height * 3 / 4;
+    if (focusWindow_.width && focusWindow_.height) {
+        const Size full = sensor_->resolution();
+        left = std::clamp<unsigned int>(focusWindow_.x * cfg.size.width / full.width, 2, cfg.size.width - 3);
+        right = std::clamp<unsigned int>((focusWindow_.x + focusWindow_.width) * cfg.size.width / full.width, left + 1, cfg.size.width - 2);
+        top = std::clamp<unsigned int>(focusWindow_.y * cfg.size.height / full.height, 2, cfg.size.height - 3);
+        bottom = std::clamp<unsigned int>((focusWindow_.y + focusWindow_.height) * cfg.size.height / full.height, top + 1, cfg.size.height - 2);
+    }
+    for (unsigned int row = top; row < bottom; row += 8) {
+        for (unsigned int col = left; col < right; col += 8) {
+            const unsigned int i = row * cfg.stride + col;
+            const int dx = int(y[i + 2]) - int(y[i - 2]);
+            const int dy = int(y[i + 2 * cfg.stride]) - int(y[i - 2 * cfg.stride]);
+            gradient += dx * dx + dy * dy;
+            light += y[i];
+            ++count;
+        }
+    }
+    const double score = gradient * count / std::max(1.0, light * light);
+    LOG(SimplePipeline, Info) << "Osprey focus position " << focusScanPosition_
+                             << " contrast " << score;
+    if (score > focusBestScore_) {
+        focusBestScore_ = score;
+        focusBestPosition_ = focusScanPosition_;
+    }
+    CameraLens *lens = sensor_->focusLens();
+    if (focusScanPosition_ >= focusEnd_) {
+        if (focusStep_ == 64) {
+            // Refine around the coarse maximum instead of scanning every position.
+            focusScanPosition_ = std::max(0, focusBestPosition_ - 48);
+            focusEnd_ = std::min(480, focusBestPosition_ + 48);
+            focusStep_ = 16;
+            focusBestScore_ = -1;
+        } else {
+            focusScanPosition_ = focusBestPosition_;
+            focusSettling_ = true;
+        }
+    } else {
+        focusScanPosition_ = std::min(focusScanPosition_ + focusStep_, focusEnd_);
+    }
+    if (lens->setFocusPosition(focusScanPosition_)) {
+        focusScanPosition_ = -1;
+        focusState_ = controls::AfStateFailed;
+        return;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    // ponytail: conservative 150 ms settle; calibrate against moving scenes later.
+    focusValidAfter_ = uint64_t(now.tv_sec) * 1000000000ULL + now.tv_nsec + 150000000ULL;
+}
+
 void SimpleCameraData::conversionOutputDone(FrameBuffer *buffer)
 {
+	focusBuffer(buffer);
 	SimplePipelineHandler *pipe = SimpleCameraData::pipe();
 
 	/* Complete the buffer and the request. */
 	Request *request = buffer->request();
+	if (sensor_->model() == "s5k3m2" && sensor_->focusLens())
+		{
+		request->_d()->metadata().set(controls::AfState, focusState_);
+		request->_d()->metadata().set(controls::AfMode, focusMode_);
+	}
 	if (pipe->completeBuffer(request, buffer))
 		tryCompleteRequest(request);
 }
 
 void SimpleCameraData::ispStatsReady(uint32_t frame, uint32_t bufferId)
 {
-	swIsp_->processStats(frame, bufferId,
-			     delayedCtrls_->get(frame));
+	SimpleFrameInfo *info = frameInfo_.find(frame);
+	if (!info)
+		return;
+	swIsp_->processStats(frame, bufferId, info->sensorControls);
 }
 
 void SimpleCameraData::metadataReady(uint32_t frame, const ControlList &metadata)
@@ -1604,8 +1851,14 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
 		return data->converter_->configure(inputCfg, outputCfgs);
 	} else {
 		ipa::softisp::IPAConfigInfo configInfo;
+		ret = data->sensor_->sensorInfo(&configInfo.sensorInfo);
+		if (ret)
+			return ret;
 		configInfo.sensorControls = data->sensor_->controls();
-		return data->swIsp_->configure(inputCfg, outputCfgs, configInfo, &data->controlInfo_);
+		ret = data->swIsp_->configure(inputCfg, outputCfgs, configInfo, &data->controlInfo_);
+		if (!ret)
+			data->addFocusControls();
+		return ret;
 	}
 }
 
@@ -1630,6 +1883,10 @@ int SimplePipelineHandler::exportFrameBuffers(Camera *camera, Stream *stream,
 int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlList *controls)
 {
 	SimpleCameraData *data = cameraData(camera);
+    data->flashSequence_ = UINT32_MAX;
+    data->flashStart_ = 0;
+    data->flashTorch_ = false;
+
 	V4L2VideoDevice *video = data->video_;
 	V4L2Subdevice *frameStartEmitter = data->frameStartEmitter_;
 	int ret;
@@ -1681,6 +1938,7 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
 		return ret;
 	}
 
+
 	if (data->useConversion_) {
 		if (data->converter_)
 			ret = data->converter_->start();
@@ -1699,6 +1957,26 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
 			for (std::unique_ptr<FrameBuffer> &buffer : data->conversionBuffers_)
 				video->queueBuffer(buffer.get());
 	}
+
+	data->focusWindow_ = {};
+	data->focusMode_ = controls::AfModeAuto;
+	data->focusState_ = controls::AfStateIdle;
+	data->focusScanPosition_ = -1;
+    if (data->sensor_->model() == "s5k3m2" && data->sensor_->focusLens()) {
+        if (!data->sensor_->focusLens()->init() &&
+            !data->sensor_->focusLens()->setFocusPosition(0)) {
+            data->focusScanPosition_ = 0;
+            data->focusBestPosition_ = 0;
+            data->focusBestScore_ = -1;
+            data->focusStep_ = 64;
+            data->focusEnd_ = 480;
+            data->focusSettling_ = false;
+            timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            data->focusValidAfter_ = uint64_t(now.tv_sec) * 1000000000ULL + now.tv_nsec + 1000000000ULL;
+            data->focusState_ = controls::AfStateScanning;
+        }
+    }
 
 	return 0;
 }
@@ -1722,6 +2000,9 @@ void SimplePipelineHandler::stopDevice(Camera *camera)
 			data->swIsp_->stop();
 	}
 
+	if (data->sensor_->model() == "s5k3m2" && data->sensor_->focusLens()) {
+		data->sensor_->focusLens()->close();
+	}
 	video->streamOff();
 	video->releaseBuffers();
 
@@ -1737,6 +2018,7 @@ void SimplePipelineHandler::stopDevice(Camera *camera)
 int SimplePipelineHandler::queueRequestDevice(Camera *camera, Request *request)
 {
 	SimpleCameraData *data = cameraData(camera);
+	data->focusControls(request->controls());
 	int ret;
 
 	std::map<const Stream *, FrameBuffer *> buffers;

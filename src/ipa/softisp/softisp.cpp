@@ -186,6 +186,7 @@ int IPASoftIsp::init(const IPASettings &settings,
 
 int IPASoftIsp::configure(const IPAConfigInfo &configInfo, ControlInfoMap *ipaControls)
 {
+	context_.sensorInfo = configInfo.sensorInfo;
 	context_.sensorControls = configInfo.sensorControls;
 
 	/* Clear the IPA context before the streaming session. */

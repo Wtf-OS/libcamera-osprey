@@ -7,6 +7,7 @@
 
 #include "../camera_buffer.h"
 
+#include <cros_gralloc_handle.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -41,6 +42,7 @@ public:
 
 private:
 	struct PlaneInfo {
+		int fd;
 		unsigned int stride;
 		unsigned int offset;
 		unsigned int size;
@@ -69,6 +71,26 @@ CameraBuffer::Private::Private([[maybe_unused]] CameraBuffer *cameraBuffer,
 		LOG(HAL, Error) << "Invalid pixel format: " << pixelFormat;
 		return;
 	}
+
+ // Minigbm may duplicate plane fds and append a metadata fd.
+ const auto *h = reinterpret_cast<const cros_gralloc_handle *>(camera3Buffer);
+ if (sizeof(native_handle_t) + (camera3Buffer->numFds + camera3Buffer->numInts) * sizeof(int) == sizeof(*h) && h->magic == 0xABCDDCBA) {
+  if (h->num_planes != info.numPlanes() || h->num_planes > DRV_MAX_PLANES || camera3Buffer->numFds < static_cast<int>(h->num_planes)) {
+   error_ = -EINVAL;
+   return;
+  }
+  for (unsigned int i = 0; i < h->num_planes; ++i) {
+   off_t length = lseek(h->fds[i], 0, SEEK_END);
+   if (length < 0 || static_cast<uint64_t>(h->offsets[i]) + h->sizes[i] > static_cast<uint64_t>(length)) {
+    error_ = -EINVAL;
+    return;
+   }
+   planeInfo_.push_back({ h->fds[i], h->strides[i], h->offsets[i], h->sizes[i] });
+  }
+  fd_ = h->fds[0];
+  bufferLength_ = lseek(fd_, 0, SEEK_END);
+  return;
+ }
 
 	/*
 	 * As Android doesn't offer an API to query buffer layouts, assume for
@@ -108,6 +130,7 @@ CameraBuffer::Private::Private([[maybe_unused]] CameraBuffer *cameraBuffer,
 	for (unsigned int i = 0; i < numPlanes; ++i) {
 		const unsigned int planeSize = info.planeSize(size, i);
 
+		planeInfo_[i].fd = fd_;
 		planeInfo_[i].stride = info.stride(size.width, i, 1u);
 		planeInfo_[i].offset = offset;
 		planeInfo_[i].size = planeSize;
@@ -179,19 +202,17 @@ void CameraBuffer::Private::map()
 	ASSERT(fd_ != -1);
 	ASSERT(bufferLength_ >= 0);
 
-	void *address = mmap(nullptr, bufferLength_, flags_, MAP_SHARED, fd_, 0);
-	if (address == MAP_FAILED) {
-		error_ = -errno;
-		LOG(HAL, Error) << "Failed to mmap plane";
-		return;
-	}
-	maps_.emplace_back(static_cast<uint8_t *>(address), bufferLength_);
-
-	planes_.reserve(planeInfo_.size());
-	for (const auto &info : planeInfo_) {
-		planes_.emplace_back(
-			static_cast<uint8_t *>(address) + info.offset, info.size);
-	}
+ for (const auto &info : planeInfo_) {
+  size_t length = static_cast<size_t>(info.offset) + info.size;
+  void *address = mmap(nullptr, length, flags_, MAP_SHARED, info.fd, 0);
+  if (address == MAP_FAILED) {
+   error_ = -errno;
+   LOG(HAL, Error) << "Failed to mmap plane";
+   return;
+  }
+  maps_.emplace_back(static_cast<uint8_t *>(address), length);
+  planes_.emplace_back(static_cast<uint8_t *>(address) + info.offset, info.size);
+ }
 
 	mapped_ = true;
 }

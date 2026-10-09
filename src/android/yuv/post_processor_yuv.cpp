@@ -72,9 +72,9 @@ void PostProcessorYuv::process(Camera3RequestDescriptor::StreamBuffer *streamBuf
 				    sourceStride_[1],
 				    sourceSize_.width, sourceSize_.height,
 				    destination->plane(0).data(),
-				    destinationStride_[0],
+				    destination->stride(0),
 				    destination->plane(1).data(),
-				    destinationStride_[1],
+				    destination->stride(1),
 				    destinationSize_.width,
 				    destinationSize_.height,
 				    libyuv::FilterMode::kFilterBilinear);

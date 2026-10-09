@@ -170,6 +170,8 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
 		return;
 	}
 
+	ipaControlInfo_ = *ipaControls;
+
 	ipa_->paramsComputed.connect(this, &SoftwareIsp::saveIspParams);
 	ipa_->metadataReady.connect(this,
 				    [this](uint32_t frame, const ControlList &metadata) {
@@ -293,6 +295,8 @@ int SoftwareIsp::configure(const StreamConfiguration &inputCfg,
 	if (ret < 0)
 		return ret;
 
+	ipaControlInfo_ = *ipaControls;
+
 	ret = debayer_->configure(inputCfg, outputCfgs, ccmEnabled_);
 	if (ret < 0)
 		return ret;
@@ -322,6 +326,11 @@ int SoftwareIsp::exportBuffers(const Stream *stream, unsigned int count,
 	if (stream == nullptr)
 		return -EINVAL;
 
+	const StreamConfiguration &cfg = stream->configuration();
+	if (cfg.pixelFormat == formats::NV12)
+		return dmaHeap_.exportBuffers(count,
+			{ cfg.stride * cfg.size.height,
+			  cfg.stride * ((cfg.size.height + 1) / 2) }, buffers);
 	return dmaHeap_.exportBuffers(count, { debayer_->frameSize() }, buffers);
 }
 
@@ -332,7 +341,13 @@ int SoftwareIsp::exportBuffers(const Stream *stream, unsigned int count,
  */
 void SoftwareIsp::queueRequest(const uint32_t frame, const ControlList &controls)
 {
-	ipa_->queueRequest(frame, controls);
+	// Pipeline and debayer controls are handled outside the IPA.
+	ControlList ipaControls(ipaControlInfo_);
+	for (const auto &[id, value] : controls) {
+		if (ipaControlInfo_.count(id))
+			ipaControls.set(id, value);
+	}
+	ipa_->queueRequest(frame, ipaControls);
 }
 
 /**

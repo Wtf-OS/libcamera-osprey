@@ -462,7 +462,11 @@ void Thread::setThreadAffinityInternal()
 		return;
 
 	const cpu_set_t &cpuset = data_->cpuset_.value();
+	#ifdef __BIONIC__
+	sched_setaffinity(pthread_gettid_np(thread_.native_handle()), sizeof(cpuset), &cpuset);
+#else
 	pthread_setaffinity_np(thread_.native_handle(), sizeof(cpuset), &cpuset);
+#endif
 }
 
 /**

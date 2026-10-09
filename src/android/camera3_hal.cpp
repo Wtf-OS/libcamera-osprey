@@ -10,6 +10,7 @@
 #include <libcamera/base/log.h>
 
 #include "camera_device.h"
+#include <charconv>
 #include "camera_hal_manager.h"
 
 using namespace libcamera;
@@ -45,10 +46,16 @@ static int hal_open_legacy([[maybe_unused]] const struct hw_module_t *module,
 	return -ENOSYS;
 }
 
-static int hal_set_torch_mode([[maybe_unused]] const char *camera_id,
-			      [[maybe_unused]] bool enabled)
+static int hal_set_torch_mode(const char *camera_id, bool enabled)
 {
-	return -ENOSYS;
+    if (!camera_id)
+        return -EINVAL;
+    unsigned int id;
+    std::string name(camera_id);
+    auto [end, error] = std::from_chars(name.data(), name.data() + name.size(), id);
+    if (error != std::errc{} || end != name.data() + name.size())
+        return -EINVAL;
+    return CameraHalManager::instance()->setTorchMode(id, enabled);
 }
 
 /*

@@ -675,6 +675,9 @@ int CameraSensorLegacy::discoverAncillaryDevices()
 		switch (ancillary->function()) {
 		case MEDIA_ENT_F_LENS:
 			focusLens_ = std::make_unique<CameraLens>(ancillary);
+			/* Osprey VCM responds only with the sensor power sequence active. */
+			if (model_ == "s5k3m2")
+				break;
 			ret = focusLens_->init();
 			if (ret) {
 				LOG(CameraSensor, Error)

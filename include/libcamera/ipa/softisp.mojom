@@ -9,6 +9,7 @@ module ipa.softisp;
 import "include/libcamera/ipa/core.mojom";
 
 struct IPAConfigInfo {
+	libcamera.IPACameraSensorInfo sensorInfo;
 	libcamera.ControlInfoMap sensorControls;
 };
 

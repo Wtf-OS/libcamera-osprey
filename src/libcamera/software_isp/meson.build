@@ -38,3 +38,5 @@ if mesa_works
         libglesv2,
     ]
 endif
+
+libcamera_deps += dependency('libyuv')

@@ -8,6 +8,7 @@
 #pragma once
 
 #include <map>
+#include <atomic>
 #include <memory>
 #include <queue>
 #include <vector>
@@ -46,6 +47,7 @@ public:
 
 	int open(const hw_module_t *hardwareModule);
 	void close();
+	int setTorchMode(bool enabled);
 	void flush();
 
 	unsigned int id() const { return id_; }
@@ -102,6 +104,7 @@ private:
 	std::unique_ptr<CameraMetadata> getResultMetadata(
 		const Camera3RequestDescriptor &descriptor) const;
 
+	std::atomic<bool> flashCameraOpen_ = false;
 	unsigned int id_;
 	camera3_device_t camera3Device_;
 

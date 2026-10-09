@@ -6,6 +6,7 @@
  */
 
 #include "camera_capabilities.h"
+#include "libcamera/internal/osprey_flash.h"
 
 #include <algorithm>
 #include <array>
@@ -45,10 +46,13 @@ namespace {
 const std::vector<Size> camera3Resolutions = {
 	{ 320, 240 },
 	{ 640, 480 },
+	{ 1272, 720 },
 	{ 1280, 720 },
 	{ 1280, 960 },
 	{ 1600, 1200 },
-	{ 1920, 1080 }
+	{ 1920, 1080 },
+	{ 2072, 1560 },
+	{ 4152, 3120 }
 };
 
 /*
@@ -502,7 +506,8 @@ int CameraCapabilities::initializeStreamConfigurations()
 	 * \todo JPEG - Adjust the maximum available resolution by taking the
 	 * JPEG encoder requirements into account (alignment and aspect ratio).
 	 */
-	const Size maxRes = cfg.size;
+	// Leave the RAW debayer border inside the validated full sensor mode.
+	const Size maxRes = cfg.size.boundedTo(Size{4152, 3120});
 	LOG(HAL, Debug) << "Maximum supported resolution: " << maxRes;
 
 	/*
@@ -852,6 +857,7 @@ int CameraCapabilities::initializeStaticMetadata()
 		ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER,
 		ANDROID_CONTROL_AE_TARGET_FPS_RANGE,
 		ANDROID_CONTROL_AF_MODE,
+		ANDROID_CONTROL_AF_REGIONS,
 		ANDROID_CONTROL_AF_TRIGGER,
 		ANDROID_CONTROL_AWB_LOCK,
 		ANDROID_CONTROL_AWB_MODE,
@@ -882,6 +888,7 @@ int CameraCapabilities::initializeStaticMetadata()
 		ANDROID_CONTROL_AE_STATE,
 		ANDROID_CONTROL_AE_TARGET_FPS_RANGE,
 		ANDROID_CONTROL_AF_MODE,
+		ANDROID_CONTROL_AF_REGIONS,
 		ANDROID_CONTROL_AF_STATE,
 		ANDROID_CONTROL_AF_TRIGGER,
 		ANDROID_CONTROL_AWB_LOCK,
@@ -948,6 +955,10 @@ int CameraCapabilities::initializeStaticMetadata()
 	std::vector<uint8_t> aeAvailableModes = {
 		ANDROID_CONTROL_AE_MODE_ON,
 	};
+    if (ospreyFlashAvailable(camera_->id())) {
+        aeAvailableModes.push_back(ANDROID_CONTROL_AE_MODE_ON_ALWAYS_FLASH);
+        aeAvailableModes.push_back(ANDROID_CONTROL_AE_MODE_ON_AUTO_FLASH);
+    }
 	staticMetadata_->addEntry(ANDROID_CONTROL_AE_AVAILABLE_MODES,
 				  aeAvailableModes);
 
@@ -966,6 +977,8 @@ int CameraCapabilities::initializeStaticMetadata()
 	std::vector<uint8_t> availableAfModes = {
 		ANDROID_CONTROL_AF_MODE_OFF,
 	};
+	if (controlsInfo.count(&controls::AfMode))
+		availableAfModes.push_back(ANDROID_CONTROL_AF_MODE_AUTO);
 	staticMetadata_->addEntry(ANDROID_CONTROL_AF_AVAILABLE_MODES,
 				  availableAfModes);
 
@@ -998,7 +1011,7 @@ int CameraCapabilities::initializeStaticMetadata()
 				  availableAwbModes);
 
 	std::vector<int32_t> availableMaxRegions = {
-		0, 0, 0,
+		0, 0, controlsInfo.count(&controls::AfWindows) ? 1 : 0,
 	};
 	staticMetadata_->addEntry(ANDROID_CONTROL_MAX_REGIONS,
 				  availableMaxRegions);
@@ -1006,7 +1019,8 @@ int CameraCapabilities::initializeStaticMetadata()
 	std::vector<uint8_t> sceneModesOverride = {
 		ANDROID_CONTROL_AE_MODE_ON,
 		ANDROID_CONTROL_AWB_MODE_AUTO,
-		ANDROID_CONTROL_AF_MODE_OFF,
+		static_cast<uint8_t>(controlsInfo.count(&controls::AfMode) ?
+			ANDROID_CONTROL_AF_MODE_AUTO : ANDROID_CONTROL_AF_MODE_OFF),
 	};
 	staticMetadata_->addEntry(ANDROID_CONTROL_SCENE_MODE_OVERRIDES,
 				  sceneModesOverride);
@@ -1243,7 +1257,7 @@ int CameraCapabilities::initializeStaticMetadata()
 		    ANDROID_SYNC_MAX_LATENCY_UNKNOWN);
 
 	/* Flash static metadata. */
-	char flashAvailable = ANDROID_FLASH_INFO_AVAILABLE_FALSE;
+	char flashAvailable = ospreyFlashAvailable(camera_->id()) ? ANDROID_FLASH_INFO_AVAILABLE_TRUE : ANDROID_FLASH_INFO_AVAILABLE_FALSE;
 	staticMetadata_->addEntry(ANDROID_FLASH_INFO_AVAILABLE,
 				  flashAvailable);
 
@@ -1285,7 +1299,12 @@ int CameraCapabilities::initializeStaticMetadata()
 	staticMetadata_->addEntry(ANDROID_LENS_INFO_HYPERFOCAL_DISTANCE,
 				  hypeFocalDistance);
 
-	float minFocusDistance = 0;
+	/* ponytail: uncalibrated AF lens range, diopter calibration remains. */
+    float minFocusDistance = controlsInfo.count(&controls::AfMode) ? 10.0f : 0.0f;
+    if (controlsInfo.count(&controls::AfMode)) {
+        uint8_t calibration = ANDROID_LENS_INFO_FOCUS_DISTANCE_CALIBRATION_UNCALIBRATED;
+        staticMetadata_->addEntry(ANDROID_LENS_INFO_FOCUS_DISTANCE_CALIBRATION, calibration);
+    }
 	staticMetadata_->addEntry(ANDROID_LENS_INFO_MINIMUM_FOCUS_DISTANCE,
 				  minFocusDistance);
 
@@ -1349,8 +1368,7 @@ int CameraCapabilities::initializeStaticMetadata()
 		unsigned int fps =
 			static_cast<unsigned int>(floor(1e9 / entry.minFrameDurationNsec));
 
-		if (entry.androidFormat != HAL_PIXEL_FORMAT_BLOB && fps < 30)
-			continue;
+		/* Advertise real frame rates, including sensors below 30 FPS. */
 
 		/*
 		 * Collect the FPS of the maximum YUV output size to populate
@@ -1568,7 +1586,8 @@ std::unique_ptr<CameraMetadata> CameraCapabilities::requestTemplatePreview() con
 	requestTemplate->addEntry(ANDROID_CONTROL_AE_ANTIBANDING_MODE,
 				  aeAntibandingMode);
 
-	uint8_t afMode = ANDROID_CONTROL_AF_MODE_OFF;
+	uint8_t afMode = camera_->controls().count(&controls::AfMode) ?
+		ANDROID_CONTROL_AF_MODE_AUTO : ANDROID_CONTROL_AF_MODE_OFF;
 	requestTemplate->addEntry(ANDROID_CONTROL_AF_MODE, afMode);
 
 	uint8_t afTrigger = ANDROID_CONTROL_AF_TRIGGER_IDLE;
@@ -1587,7 +1606,8 @@ std::unique_ptr<CameraMetadata> CameraCapabilities::requestTemplatePreview() con
 	requestTemplate->addEntry(ANDROID_STATISTICS_FACE_DETECT_MODE,
 				  faceDetectMode);
 
-	uint8_t noiseReduction = ANDROID_NOISE_REDUCTION_MODE_OFF;
+	uint8_t noiseReduction = camera_->controls().count(&controls::draft::NoiseReductionMode) ?
+        ANDROID_NOISE_REDUCTION_MODE_FAST : ANDROID_NOISE_REDUCTION_MODE_OFF;
 	requestTemplate->addEntry(ANDROID_NOISE_REDUCTION_MODE,
 				  noiseReduction);
 
@@ -1618,6 +1638,10 @@ std::unique_ptr<CameraMetadata> CameraCapabilities::requestTemplateStill() const
 	if (!stillTemplate)
 		return nullptr;
 
+    if (camera_->controls().count(&controls::draft::NoiseReductionMode)) {
+        const uint8_t mode = ANDROID_NOISE_REDUCTION_MODE_HIGH_QUALITY;
+        stillTemplate->updateEntry(ANDROID_NOISE_REDUCTION_MODE, mode);
+    }
 	return stillTemplate;
 }
 

@@ -12,6 +12,7 @@ android_deps = [
     dependency('libjpeg', required : get_option('android')),
     libcamera_private,
     libyuv_dep,
+    dependency('camera_metadata'),
 ]
 
 foreach dep : android_deps
@@ -41,19 +42,9 @@ subdir('cros')
 subdir('jpeg')
 subdir('mm')
 
-android_camera_metadata_sources = files([
-    'metadata/camera_metadata.c',
-])
-
-android_camera_metadata = static_library('camera_metadata',
-                                         android_camera_metadata_sources,
-                                         c_args : '-Wno-shadow',
-                                         include_directories : android_includes)
-
 libcamera_hal = shared_library('libcamera-hal',
                                android_hal_sources,
                                name_prefix : '',
-                               link_with : android_camera_metadata,
                                install : true,
                                cpp_args : android_cpp_args,
                                include_directories : android_includes,

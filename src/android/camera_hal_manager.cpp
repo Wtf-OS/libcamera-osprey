@@ -289,3 +289,26 @@ void CameraHalManager::setCallbacks(const camera_module_callbacks_t *callbacks)
 								CAMERA_DEVICE_STATUS_PRESENT);
 	}
 }
+
+int CameraHalManager::setTorchMode(unsigned int id, bool enabled)
+{
+    int ret;
+    {
+        MutexLocker locker(mutex_);
+        CameraDevice *camera = cameraDeviceFromHalId(id);
+        if (!camera)
+            return -EINVAL;
+        ret = camera->setTorchMode(enabled);
+    }
+    if (!ret)
+        torchStatus(id, enabled ? TORCH_MODE_STATUS_AVAILABLE_ON : TORCH_MODE_STATUS_AVAILABLE_OFF);
+    return ret;
+}
+
+void CameraHalManager::torchStatus(unsigned int id, int status)
+{
+    if (callbacks_ && callbacks_->torch_mode_status_change) {
+        std::string name = std::to_string(id);
+        callbacks_->torch_mode_status_change(callbacks_, name.c_str(), status);
+    }
+}

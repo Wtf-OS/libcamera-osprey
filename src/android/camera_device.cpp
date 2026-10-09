@@ -6,6 +6,8 @@
  */
 
 #include "camera_device.h"
+#include "libcamera/internal/osprey_flash.h"
+#include "camera_hal_manager.h"
 
 #include <algorithm>
 #include <fstream>
@@ -377,6 +379,11 @@ int CameraDevice::initialize(const CameraConfigData *cameraConfigData)
 		orientation_ = 0;
 	}
 
+ // The Osprey driver currently supplies a default zero rotation.
+ // An explicit per-device HAL configuration is authoritative.
+ if (cameraConfigData && cameraConfigData->rotation >= 0)
+  orientation_ = cameraConfigData->rotation;
+
 	return capabilities_.initialize(camera_, orientation_, facing_);
 }
 
@@ -392,6 +399,11 @@ int CameraDevice::open(const hw_module_t *hardwareModule)
 		return ret;
 	}
 
+    if (ospreyFlashAvailable(camera_->id())) {
+        ospreyFlashWrite("brightness", false);
+        flashCameraOpen_ = true;
+        CameraHalManager::instance()->torchStatus(id_, TORCH_MODE_STATUS_NOT_AVAILABLE);
+    }
 	/* Initialize the hw_device_t in the instance camera3_module_t. */
 	camera3Device_.common.tag = HARDWARE_DEVICE_TAG;
 	camera3Device_.common.version = CAMERA_DEVICE_API_VERSION_3_3;
@@ -413,6 +425,11 @@ void CameraDevice::close()
 	stop();
 
 	camera_->release();
+    if (ospreyFlashAvailable(camera_->id())) {
+        ospreyFlashWrite("brightness", false);
+        flashCameraOpen_ = false;
+        CameraHalManager::instance()->torchStatus(id_, TORCH_MODE_STATUS_AVAILABLE_OFF);
+    }
 }
 
 void CameraDevice::flush()
@@ -426,6 +443,9 @@ void CameraDevice::flush()
 	}
 
 	camera_->stop();
+    if (ospreyFlashAvailable(camera_->id())) {
+        ospreyFlashWrite("brightness", false);
+    }
 
 	MutexLocker stateLock(stateMutex_);
 	state_ = State::Stopped;
@@ -705,6 +725,28 @@ int CameraDevice::configureStreams(camera3_stream_configuration_t *stream_list)
 	}
 
 	sortCamera3StreamConfigs(streamConfigs, jpegStream);
+	/* Scale smaller NV12 streams with the existing HAL postprocessor.
+	 * SoftISP produces one processed stream, shared by preview and capture.
+	 */
+	if (!streamConfigs.empty() && streamConfigs[0].config.pixelFormat == formats::NV12) {
+		auto &largest = streamConfigs[0];
+		for (size_t i = 1; i < streamConfigs.size();) {
+			auto &candidate = streamConfigs[i];
+			if (candidate.config.pixelFormat != formats::NV12 ||
+			    candidate.config.size.width > largest.config.size.width ||
+			    candidate.config.size.height > largest.config.size.height) {
+				++i;
+				continue;
+			}
+			for (auto stream : candidate.streams) {
+				stream.type = CameraStream::Type::Mapped;
+				stream.stream->usage |= GRALLOC_USAGE_SW_WRITE_OFTEN;
+				largest.streams.push_back(stream);
+			}
+			largest.streams[0].stream->usage |= GRALLOC_USAGE_SW_READ_OFTEN;
+			streamConfigs.erase(streamConfigs.begin() + i);
+		}
+	}
 	for (const auto &streamConfig : streamConfigs) {
 		config->addConfiguration(streamConfig.config);
 
@@ -732,12 +774,14 @@ int CameraDevice::configureStreams(camera3_stream_configuration_t *stream_list)
 	case CameraConfiguration::Valid:
 		break;
 	case CameraConfiguration::Adjusted:
-		LOG(HAL, Info) << "Camera configuration adjusted";
-
-		for (const StreamConfiguration &cfg : *config)
-			LOG(HAL, Info) << " - " << cfg.toString();
-
-		return -EINVAL;
+		if (config->size() != streamConfigs.size())
+			return -EINVAL;
+		for (size_t i = 0; i < config->size(); ++i) {
+			if (config->at(i).size != streamConfigs[i].config.size ||
+			    config->at(i).pixelFormat != streamConfigs[i].config.pixelFormat)
+				return -EINVAL;
+		}
+		break;
 	case CameraConfiguration::Invalid:
 		LOG(HAL, Info) << "Camera configuration invalid";
 		return -EINVAL;
@@ -806,7 +850,64 @@ int CameraDevice::processControls(Camera3RequestDescriptor *descriptor)
 	/* Translate the Android request settings to libcamera controls. */
 	ControlList &controls = descriptor->request_->controls();
 	camera_metadata_ro_entry_t entry;
-	if (settings.getEntry(ANDROID_SCALER_CROP_REGION, &entry)) {
+    if (camera_->controls().count(&controls::draft::OspreyFlashMode)) {
+        int mode = 0;
+        if (settings.getEntry(ANDROID_FLASH_MODE, &entry)) {
+            if (*entry.data.u8 == ANDROID_FLASH_MODE_TORCH)
+                mode = 2;
+            else if (*entry.data.u8 == ANDROID_FLASH_MODE_SINGLE)
+                mode = 1;
+        }
+        if (settings.getEntry(ANDROID_CONTROL_AE_MODE, &entry)) {
+            const uint8_t ae = *entry.data.u8;
+            if (settings.getEntry(ANDROID_CONTROL_CAPTURE_INTENT, &entry) &&
+                *entry.data.u8 == ANDROID_CONTROL_CAPTURE_INTENT_STILL_CAPTURE) {
+                if (ae == ANDROID_CONTROL_AE_MODE_ON_ALWAYS_FLASH)
+                    mode = 1;
+                else if (ae == ANDROID_CONTROL_AE_MODE_ON_AUTO_FLASH)
+                    mode = 3;
+            }
+        }
+        controls.set(controls::draft::OspreyFlashMode, mode);
+    }
+    if (camera_->controls().count(&controls::draft::NoiseReductionMode)) {
+        int32_t mode = controls::draft::NoiseReductionModeFast;
+        if (settings.getEntry(ANDROID_NOISE_REDUCTION_MODE, &entry)) {
+            if (entry.count != 1 || *entry.data.u8 > ANDROID_NOISE_REDUCTION_MODE_HIGH_QUALITY)
+                return -EINVAL;
+            mode = *entry.data.u8;
+        }
+        controls.set(controls::draft::NoiseReductionMode, mode);
+    }
+    if (camera_->controls().count(&controls::AfWindows) &&
+        settings.getEntry(ANDROID_CONTROL_AF_REGIONS, &entry) && entry.count >= 5) {
+        const int32_t *area = entry.data.i32;
+        const auto full = camera_->properties().get(properties::PixelArrayArea);
+        if (full && area[4] > 0 && area[0] >= 0 && area[1] >= 0 &&
+            area[2] > area[0] && area[3] > area[1] &&
+            area[2] <= int(full->width) && area[3] <= int(full->height)) {
+            const Rectangle window(area[0], area[1], area[2] - area[0], area[3] - area[1]);
+            controls.set(controls::AfWindows, std::span<const Rectangle>(&window, 1));
+        } else {
+            controls.set(controls::AfWindows, std::span<const Rectangle>{});
+        }
+    }
+    if (camera_->controls().count(&controls::AfMode)) {
+        if (settings.getEntry(ANDROID_CONTROL_AF_MODE, &entry)) {
+            if (*entry.data.u8 != ANDROID_CONTROL_AF_MODE_OFF &&
+                *entry.data.u8 != ANDROID_CONTROL_AF_MODE_AUTO)
+                return -EINVAL;
+            controls.set(controls::AfMode, *entry.data.u8 == ANDROID_CONTROL_AF_MODE_OFF ?
+                controls::AfModeManual : controls::AfModeAuto);
+        }
+        if (settings.getEntry(ANDROID_CONTROL_AF_TRIGGER, &entry)) {
+            if (*entry.data.u8 == ANDROID_CONTROL_AF_TRIGGER_START)
+                controls.set(controls::AfTrigger, controls::AfTriggerStart);
+            else if (*entry.data.u8 == ANDROID_CONTROL_AF_TRIGGER_CANCEL)
+                controls.set(controls::AfTrigger, controls::AfTriggerCancel);
+        }
+    }
+    if (settings.getEntry(ANDROID_SCALER_CROP_REGION, &entry)) {
 		const int32_t *data = entry.data.i32;
 		Rectangle cropRegion{ data[0], data[1],
 				      static_cast<unsigned int>(data[2]),
@@ -1328,7 +1429,8 @@ void CameraDevice::sendCaptureResults()
 		captureResult.num_output_buffers = resultBuffers.size();
 		captureResult.output_buffers = resultBuffers.data();
 
-		if (descriptor->status_ == Camera3RequestDescriptor::Status::Success)
+		/* Metadata remains valid when only an output buffer failed. */
+		if (captureResult.result)
 			captureResult.partial_result = 1;
 
 		callbacks_->process_capture_result(callbacks_, &captureResult);
@@ -1472,6 +1574,9 @@ CameraDevice::getResultMetadata(const Camera3RequestDescriptor &descriptor) cons
 	resultMetadata->addEntry(ANDROID_CONTROL_AE_LOCK, value);
 
 	value = ANDROID_CONTROL_AE_MODE_ON;
+    if (settings.getEntry(ANDROID_CONTROL_AE_MODE, &entry) && ospreyFlashAvailable(camera_->id())) {
+        value = *entry.data.u8;
+    }
 	resultMetadata->addEntry(ANDROID_CONTROL_AE_MODE, value);
 
 	if (settings.getEntry(ANDROID_CONTROL_AE_TARGET_FPS_RANGE, &entry))
@@ -1491,14 +1596,32 @@ CameraDevice::getResultMetadata(const Camera3RequestDescriptor &descriptor) cons
 	value = ANDROID_CONTROL_AE_STATE_CONVERGED;
 	resultMetadata->addEntry(ANDROID_CONTROL_AE_STATE, value);
 
-	value = ANDROID_CONTROL_AF_MODE_OFF;
+	value = metadata.get(controls::AfMode).value_or(controls::AfModeManual) == controls::AfModeAuto ?
+        ANDROID_CONTROL_AF_MODE_AUTO : ANDROID_CONTROL_AF_MODE_OFF;
 	resultMetadata->addEntry(ANDROID_CONTROL_AF_MODE, value);
 
 	value = ANDROID_CONTROL_AF_STATE_INACTIVE;
-	resultMetadata->addEntry(ANDROID_CONTROL_AF_STATE, value);
+    if (auto state = metadata.get(controls::AfState)) {
+        switch (*state) {
+        case controls::AfStateScanning: value = ANDROID_CONTROL_AF_STATE_ACTIVE_SCAN; break;
+        case controls::AfStateFocused: value = ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED; break;
+        case controls::AfStateFailed: value = ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED; break;
+        default: break;
+        }
+    }
+    resultMetadata->addEntry(ANDROID_CONTROL_AF_STATE, value);
 
 	value = ANDROID_CONTROL_AF_TRIGGER_IDLE;
 	resultMetadata->addEntry(ANDROID_CONTROL_AF_TRIGGER, value);
+    if (camera_->controls().count(&controls::AfWindows)) {
+        if (settings.getEntry(ANDROID_CONTROL_AF_REGIONS, &entry))
+            resultMetadata->addEntry(ANDROID_CONTROL_AF_REGIONS, entry.data.i32, entry.count);
+        else {
+            const int32_t region[] = { 0, 0, 0, 0, 0 };
+            resultMetadata->addEntry(ANDROID_CONTROL_AF_REGIONS, region, 5);
+        }
+    }
+
 
 	value = ANDROID_CONTROL_AWB_MODE_AUTO;
 	resultMetadata->addEntry(ANDROID_CONTROL_AWB_MODE, value);
@@ -1510,6 +1633,9 @@ CameraDevice::getResultMetadata(const Camera3RequestDescriptor &descriptor) cons
 	resultMetadata->addEntry(ANDROID_CONTROL_AWB_STATE, value);
 
 	value = ANDROID_CONTROL_CAPTURE_INTENT_PREVIEW;
+    if (settings.getEntry(ANDROID_CONTROL_CAPTURE_INTENT, &entry)) {
+        value = *entry.data.u8;
+    }
 	resultMetadata->addEntry(ANDROID_CONTROL_CAPTURE_INTENT, value);
 
 	value = ANDROID_CONTROL_EFFECT_MODE_OFF;
@@ -1524,10 +1650,14 @@ CameraDevice::getResultMetadata(const Camera3RequestDescriptor &descriptor) cons
 	value = ANDROID_CONTROL_VIDEO_STABILIZATION_MODE_OFF;
 	resultMetadata->addEntry(ANDROID_CONTROL_VIDEO_STABILIZATION_MODE, value);
 
-	value = ANDROID_FLASH_MODE_OFF;
+    const auto flashMode = descriptor.request_->controls().get(controls::draft::OspreyFlashMode);
+    value = flashMode.value_or(0) == 2 ? ANDROID_FLASH_MODE_TORCH :
+        flashMode.value_or(0) == 1 ? ANDROID_FLASH_MODE_SINGLE : ANDROID_FLASH_MODE_OFF;
 	resultMetadata->addEntry(ANDROID_FLASH_MODE, value);
 
-	value = ANDROID_FLASH_STATE_UNAVAILABLE;
+    value = ospreyFlashAvailable(camera_->id()) ?
+        (metadata.get(controls::draft::OspreyFlashFired).value_or(false) ?
+            ANDROID_FLASH_STATE_FIRED : ANDROID_FLASH_STATE_READY) : ANDROID_FLASH_STATE_UNAVAILABLE;
 	resultMetadata->addEntry(ANDROID_FLASH_STATE, value);
 
 	if (settings.getEntry(ANDROID_LENS_APERTURE, &entry))
@@ -1560,7 +1690,8 @@ CameraDevice::getResultMetadata(const Camera3RequestDescriptor &descriptor) cons
 	value = ANDROID_STATISTICS_SCENE_FLICKER_NONE;
 	resultMetadata->addEntry(ANDROID_STATISTICS_SCENE_FLICKER, value);
 
-	value = ANDROID_NOISE_REDUCTION_MODE_OFF;
+	value = descriptor.settings_.getEntry(ANDROID_NOISE_REDUCTION_MODE, &entry) ?
+        *entry.data.u8 : ANDROID_NOISE_REDUCTION_MODE_FAST;
 	resultMetadata->addEntry(ANDROID_NOISE_REDUCTION_MODE, value);
 
 	/* 33.3 msec */
@@ -1673,4 +1804,13 @@ CameraDevice::getResultMetadata(const Camera3RequestDescriptor &descriptor) cons
 	}
 
 	return resultMetadata;
+}
+
+int CameraDevice::setTorchMode(bool enabled)
+{
+    if (!ospreyFlashAvailable(camera_->id()))
+        return -ENOSYS;
+    if (flashCameraOpen_)
+        return -EBUSY;
+    return ospreyFlashWrite("brightness", enabled);
 }

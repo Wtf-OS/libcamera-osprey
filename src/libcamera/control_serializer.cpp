@@ -421,8 +421,10 @@ ControlValue ControlSerializer::loadControlValue(ByteStreamBuffer &buffer,
 template<>
 ControlInfoMap ControlSerializer::deserialize<ControlInfoMap>(ByteStreamBuffer &buffer)
 {
-	const struct ipa_controls_header *hdr = buffer.read<decltype(*hdr)>();
-	if (!hdr) {
+	/* IPC packets need not align structures on ARM32. */
+	struct ipa_controls_header header;
+	const auto *hdr = &header;
+	if (buffer.read(&header)) {
 		LOG(Serializer, Error) << "Out of data";
 		return {};
 	}
@@ -477,8 +479,9 @@ ControlInfoMap ControlSerializer::deserialize<ControlInfoMap>(ByteStreamBuffer &
 
 	ControlInfoMap::Map ctrls;
 	for (unsigned int i = 0; i < hdr->entries; ++i) {
-		const auto *entry = entries.read<const ipa_control_info_entry>();
-		if (!entry) {
+		struct ipa_control_info_entry storage;
+		const auto *entry = &storage;
+		if (entries.read(&storage)) {
 			LOG(Serializer, Error) << "Out of data";
 			return {};
 		}
@@ -566,8 +569,10 @@ ControlInfoMap ControlSerializer::deserialize<ControlInfoMap>(ByteStreamBuffer &
 template<>
 ControlList ControlSerializer::deserialize<ControlList>(ByteStreamBuffer &buffer)
 {
-	const struct ipa_controls_header *hdr = buffer.read<decltype(*hdr)>();
-	if (!hdr) {
+	/* IPC packets need not align structures on ARM32. */
+	struct ipa_controls_header header;
+	const auto *hdr = &header;
+	if (buffer.read(&header)) {
 		LOG(Serializer, Error) << "Out of data";
 		return {};
 	}
@@ -639,8 +644,9 @@ ControlList ControlSerializer::deserialize<ControlList>(ByteStreamBuffer &buffer
 	ControlList ctrls(*idMap);
 
 	for (unsigned int i = 0; i < hdr->entries; ++i) {
-		auto *list_entry = entries.read<const ipa_control_list_entry>();
-		if (!list_entry) {
+		struct ipa_control_list_entry storage;
+		const auto *list_entry = &storage;
+		if (entries.read(&storage)) {
 			LOG(Serializer, Error) << "Out of data";
 			return {};
 		}

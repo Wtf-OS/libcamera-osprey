@@ -40,6 +40,8 @@ public:
 	unsigned int numCameras() const;
 	int getCameraInfo(unsigned int id, struct camera_info *info);
 	void setCallbacks(const camera_module_callbacks_t *callbacks);
+	int setTorchMode(unsigned int id, bool enabled);
+	void torchStatus(unsigned int id, int status);
 
 private:
 	LIBCAMERA_DISABLE_COPY_AND_MOVE(CameraHalManager)

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: CC0-1.0
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      # Dark RAW10 median 1 at 1x/8x gain; represented in 16-bit units.
+      blackLevel: 64
+  - Awb:
+  - Adjust:
+  - Agc:
+...

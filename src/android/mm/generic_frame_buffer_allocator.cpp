@@ -5,6 +5,7 @@
  * Allocate FrameBuffer using gralloc API
  */
 
+#include <cros_gralloc_handle.h>
 #include <dlfcn.h>
 #include <memory>
 #include <vector>
@@ -76,8 +77,9 @@ public:
 		  hardwareModule_(nullptr),
 		  allocDevice_(nullptr)
 	{
-		hw_get_module(GRALLOC_HARDWARE_MODULE_ID, &hardwareModule_);
-		ASSERT(hardwareModule_);
+		int ret = hw_get_module(GRALLOC_HARDWARE_MODULE_ID, &hardwareModule_);
+		if (ret || !hardwareModule_)
+			LOG(HAL, Error) << "Cannot load gralloc module: " << ret;
 	}
 
 	~Private() override;
@@ -95,7 +97,8 @@ PlatformFrameBufferAllocator::Private::~Private()
 {
 	if (allocDevice_)
 		gralloc_close(allocDevice_);
-	dlclose(hardwareModule_->dso);
+	if (hardwareModule_)
+		dlclose(hardwareModule_->dso);
 }
 
 std::unique_ptr<HALFrameBuffer>
@@ -103,10 +106,13 @@ PlatformFrameBufferAllocator::Private::allocate(int halPixelFormat,
 						const libcamera::Size &size,
 						uint32_t usage)
 {
+	if (!hardwareModule_)
+		return nullptr;
+
 	if (!allocDevice_) {
 		int ret = gralloc_open(hardwareModule_, &allocDevice_);
-		if (ret) {
-			LOG(HAL, Fatal) << "gralloc_open() failed: " << ret;
+		if (ret || !allocDevice_) {
+			LOG(HAL, Error) << "gralloc_open() failed: " << ret;
 			return nullptr;
 		}
 	}
@@ -135,9 +141,16 @@ PlatformFrameBufferAllocator::Private::allocate(int halPixelFormat,
 	for (auto [i, plane] : utils::enumerate(planes)) {
 		const size_t planeSize = info.planeSize(size.height, i, stride);
 
-		plane.fd = fd;
-		plane.offset = offset;
-		plane.length = planeSize;
+		const auto *h = reinterpret_cast<const cros_gralloc_handle *>(handle);
+        if (sizeof(native_handle_t) + (handle->numFds + handle->numInts) * sizeof(int) == sizeof(*h) && h->magic == 0xABCDDCBA && h->num_planes == planes.size()) {
+            plane.fd = SharedFD{h->fds[i]};
+            plane.offset = h->offsets[i];
+            plane.length = h->sizes[i];
+        } else {
+            plane.fd = fd;
+            plane.offset = offset;
+            plane.length = planeSize;
+        }
 		offset += planeSize;
 	}
 

@@ -146,6 +146,14 @@ private:
 	std::array<double, kGammaLookupSize> gammaTable_;
 	LookupTable gammaLut_;
 	bool ccmEnabled_;
+	bool nv12Output_ = false;
+	unsigned int nv12Stride_ = 0;
+	std::vector<uint8_t> rgbBuffer_;
+	std::vector<uint8_t> nv12Buffer_;
+	bool chromaDenoise_ = false;
+	bool colourBoost_ = false;
+	bool lumaDenoise_ = false;
+	std::vector<uint8_t> chromaBuffer_;
 	DebayerParams params_;
 
 	debayerFn debayer0_;

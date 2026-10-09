@@ -17,10 +17,16 @@
 #include <utility>
 
 #include <linux/dma-buf.h>
+#include <libyuv/convert_from_argb.h>
+#include <libyuv/scale_uv.h>
+#include <libyuv/scale.h>
+#include <libyuv/planar_functions.h>
 
 #include <libcamera/base/thread.h>
 
 #include <libcamera/formats.h>
+#include <libcamera/control_ids.h>
+#include <libcamera/request.h>
 
 #include "libcamera/internal/bayer_format.h"
 #include "libcamera/internal/camera_manager.h"
@@ -115,6 +121,9 @@ DebayerCpu::DebayerCpu(std::unique_ptr<SwStatsCpu> stats, const CameraManager &c
 		configuration.option<unsigned int>({ "software_isp", "threads" }).value_or(kDefaultThreads);
 	threadCount = std::clamp(threadCount, kMinThreads, kMaxThreads);
 	threads_.resize(threadCount);
+	chromaDenoise_ = configuration.option<bool>({ "software_isp", "chroma_denoise" }).value_or(false);
+	lumaDenoise_ = configuration.option<bool>({ "software_isp", "luma_denoise" }).value_or(false);
+	colourBoost_ = configuration.option<bool>({ "software_isp", "colour_boost" }).value_or(false);
 
 	for (unsigned int i = 0; i < threads_.size(); i++)
 		threads_[i] = std::make_unique<DebayerCpuThread>(this, i, enableInputMemcpy);
@@ -433,7 +442,8 @@ int DebayerCpu::getInputConfig(PixelFormat inputFormat, DebayerInputConfig &conf
 {
 	BayerFormat bayerFormat =
 		BayerFormat::fromPixelFormat(inputFormat);
-	std::vector<PixelFormat> outputFormats = { formats::RGB888,
+	std::vector<PixelFormat> outputFormats = { formats::NV12,
+						   formats::RGB888,
 						   formats::XRGB8888,
 						   formats::ARGB8888,
 						   formats::BGR888,
@@ -667,10 +677,23 @@ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
 	}
 
 	int ret = setDebayerFunctions(inputCfg.pixelFormat,
-				      outputCfg.pixelFormat,
+				      outputCfg.pixelFormat == formats::NV12 ? formats::XRGB8888 : outputCfg.pixelFormat,
 				      ccmEnabled);
 	if (ret != 0)
 		return -EINVAL;
+
+	nv12Output_ = outputCfg.pixelFormat == formats::NV12;
+	nv12Stride_ = outputCfg.stride;
+	if (nv12Output_) {
+		/* ponytail: one RGB intermediate; fuse conversion if CPU cost requires it. */
+		outputConfig_.stride = outputCfg.size.width * 4;
+		rgbBuffer_.resize(outputConfig_.stride * outputCfg.size.height);
+		nv12Buffer_.resize(nv12Stride_ * (outputCfg.size.height + (outputCfg.size.height + 1) / 2));
+		chromaBuffer_.resize((chromaDenoise_ || lumaDenoise_) ? nv12Stride_ * outputCfg.size.height : 0);
+	} else {
+		rgbBuffer_.clear();
+		nv12Buffer_.clear();
+	}
 
 	ccmEnabled_ = ccmEnabled;
 
@@ -764,7 +787,9 @@ DebayerCpu::strideAndFrameSize(const PixelFormat &outputFormat, const Size &size
 {
 	/* round up to multiple of 8 for 64 bits alignment */
 	const PixelFormatInfo &info = PixelFormatInfo::info(outputFormat);
-	return std::make_tuple(info.stride(size.width, 0, 8), info.frameSize(size, 8));
+	// Match the linear NV12 pitch of Osprey minigbm camera buffers.
+	const unsigned int alignment = outputFormat == formats::NV12 ? 128 : 8;
+	return std::make_tuple(info.stride(size.width, 0, alignment), info.frameSize(size, alignment));
 }
 
 void DebayerCpuThread::setupInputMemcpy(const uint8_t *linePointers[])
@@ -1078,7 +1103,8 @@ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
 	for (auto &thread : threads_)
 		thread->invokeMethod(&DebayerCpuThread::process,
 				     ConnectionTypeQueued, frame,
-				     in.planes()[0].data(), out.planes()[0].data());
+				     in.planes()[0].data(),
+				     nv12Output_ ? rgbBuffer_.data() : out.planes()[0].data());
 
 	{
 		MutexLocker locker(workPendingMutex_);
@@ -1087,7 +1113,97 @@ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
 		});
 	}
 
-	metadata.planes()[0].bytesused = out.planes()[0].size();
+    const int noiseMode = output->request() ?
+        output->request()->controls().get(controls::draft::NoiseReductionMode).value_or(controls::draft::NoiseReductionModeFast) :
+        controls::draft::NoiseReductionModeFast;
+	if (nv12Output_ && colourBoost_) {
+		// Mild saturation with exact neutral row sums; NEON avoids a slow scalar CCM.
+		// ponytail: replace this visual adjustment with a measured sensor CCM later.
+		static constexpr int8_t matrix[] = {
+			74, -7, -3, 0, -1, 69, -4, 0,
+			-1, -7, 72, 0, 0, 0, 0, 64,
+		};
+		if (libyuv::ARGBColorMatrix(rgbBuffer_.data(), outputConfig_.stride,
+					  rgbBuffer_.data(), outputConfig_.stride, matrix,
+					  window_.width, window_.height)) {
+			metadata.status = FrameMetadata::FrameError;
+			return;
+		}
+	}
+
+	if (nv12Output_) {
+		const size_t ySize = nv12Stride_ * window_.height;
+		const size_t uvSize = nv12Stride_ * ((window_.height + 1) / 2);
+		const auto &planes = out.planes();
+		if (planes[0].size() < ySize ||
+		    (planes.size() == 1 ? planes[0].size() < ySize + uvSize
+				       : planes[1].size() < uvSize)) {
+			metadata.status = FrameMetadata::FrameError;
+		} else {
+			// Filter cached memory; DMA output is written once and never read back.
+			uint8_t *y = nv12Buffer_.data();
+			uint8_t *uv = y + ySize;
+			std::fill(y, y + ySize, 16);
+			std::fill(uv, uv + uvSize, 128);
+			/* DRM XRGB8888 stores B,G,R,X bytes, matching libyuv ARGB. */
+			int ret = libyuv::ARGBToNV12(rgbBuffer_.data(), outputConfig_.stride,
+						  y, nv12Stride_, uv, nv12Stride_,
+						  window_.width, window_.height);
+			if (ret)
+				metadata.status = FrameMetadata::FrameError;
+			else if (chromaDenoise_ && noiseMode != controls::draft::NoiseReductionModeOff) {
+				// libyuv's NEON filter smooths chroma; luminance stays untouched.
+				const int width = window_.width / 2;
+				const int height = (window_.height + 1) / 2;
+				const int halfWidth = (width + 1) / 2;
+				const int halfHeight = (height + 1) / 2;
+				uint8_t *smooth = chromaBuffer_.data();
+				ret = libyuv::UVScale(uv, nv12Stride_, width, height,
+							 smooth, halfWidth * 2, halfWidth, halfHeight,
+							 libyuv::kFilterBox);
+				if (!ret)
+					ret = libyuv::UVScale(smooth, halfWidth * 2, halfWidth, halfHeight,
+							     uv, nv12Stride_, width, height,
+							     libyuv::kFilterBilinear);
+				if (ret)
+					metadata.status = FrameMetadata::FrameError;
+			}
+			if (metadata.status != FrameMetadata::FrameError && lumaDenoise_ && noiseMode == controls::draft::NoiseReductionModeHighQuality) {
+				const int width = window_.width, height = window_.height;
+				const int halfWidth = (width + 1) / 2, halfHeight = (height + 1) / 2;
+				const size_t smallSize = halfWidth * halfHeight;
+				if (rgbBuffer_.size() >= smallSize + ySize) {
+					uint8_t *original = chromaBuffer_.data();
+					uint8_t *small = rgbBuffer_.data(), *smooth = small + smallSize;
+					memcpy(original, y, ySize);
+					ret = libyuv::ScalePlane(original, nv12Stride_, width, height,
+								 small, halfWidth, halfWidth, halfHeight, libyuv::kFilterBox);
+					if (!ret)
+						ret = libyuv::ScalePlane(small, halfWidth, halfWidth, halfHeight,
+									 smooth, nv12Stride_, width, height, libyuv::kFilterBilinear);
+					if (ret) {
+						metadata.status = FrameMetadata::FrameError;
+					} else {
+						// Smooth small fluctuations, preserve stronger text/edge contrast.
+						for (int row = 0; row < height; ++row) {
+							for (int col = 0; col < width; ++col) {
+								const unsigned int i = row * nv12Stride_ + col;
+								if (std::abs(int(original[i]) - smooth[i]) <= 8)
+									original[i] = smooth[i];
+							}
+						}
+						memcpy(y, original, ySize);
+					}
+				}
+			}
+			if (metadata.status != FrameMetadata::FrameError) {
+				memcpy(planes[0].data(), y, ySize);
+				memcpy(planes.size() == 1 ? planes[0].data() + ySize : planes[1].data(), uv, uvSize);
+			}
+		}
+	}
+	for (unsigned int i = 0; i < out.planes().size(); ++i)
+		metadata.planes()[i].bytesused = out.planes()[i].size();
 
 	dmaSyncers.clear();
 

@@ -2,6 +2,7 @@
 
 conf_files = files([
     'uncalibrated.yaml',
+    's5k3m2.yaml',
 ])
 
 # The install_dir must match the name from the IPAModuleInfo

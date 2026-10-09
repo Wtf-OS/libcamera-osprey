@@ -45,11 +45,16 @@ CameraLens::CameraLens(const MediaEntity *entity)
  */
 CameraLens::~CameraLens() = default;
 
+void CameraLens::close()
+{
+	subdev_.reset();
+}
+
 /**
  * \brief Initialize the camera lens instance
  *
  * This function performs the initialisation steps of the CameraLens that may
- * fail. It shall be called once and only once after constructing the instance.
+ * fail. Call once after constructing the instance or after close().
  *
  * \return 0 on success or a negative error code otherwise
  */

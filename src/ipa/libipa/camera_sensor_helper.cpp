@@ -915,6 +915,16 @@ REGISTER_CAMERA_SENSOR_HELPER("vd56g3", CameraSensorHelperVd56g3)
 
 #endif /* __DOXYGEN__ */
 
+/* The Osprey V4L2 driver exposes gain in integer 1x units (not raw Q5). */
+class CameraSensorHelperS5k3m2 : public CameraSensorHelper
+{
+public:
+ CameraSensorHelperS5k3m2() { gain_ = AnalogueGainLinear{ 1, 0, 0, 1 }; }
+};
+REGISTER_CAMERA_SENSOR_HELPER("s5k3m2", CameraSensorHelperS5k3m2)
+using CameraSensorHelperS5k5e2 = CameraSensorHelperS5k3m2;
+REGISTER_CAMERA_SENSOR_HELPER("s5k5e2", CameraSensorHelperS5k5e2)
+
 } /* namespace ipa */
 
 } /* namespace libcamera */
