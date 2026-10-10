@@ -693,7 +693,12 @@ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
 	} else {
 		rgbBuffer_.clear();
 		nv12Buffer_.clear();
+		chromaBuffer_.clear();
 	}
+	/* Release full-resolution scratch memory when returning to preview. */
+	rgbBuffer_.shrink_to_fit();
+	nv12Buffer_.shrink_to_fit();
+	chromaBuffer_.shrink_to_fit();
 
 	ccmEnabled_ = ccmEnabled;
 

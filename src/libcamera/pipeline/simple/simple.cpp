@@ -1632,6 +1632,10 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
 		else if (bufferCount > kNumBuffersMax)
 			cfg.bufferCount = kNumBuffersMax;
 
+		/* Full-resolution soft-ISP frames must fit alongside Android on 1 GB. */
+		if (data_->swIsp_ && cfg.size.width * cfg.size.height > 8000000)
+			cfg.bufferCount = std::min(cfg.bufferCount, 2U);
+
 		if (cfg.bufferCount != bufferCount) {
 			LOG(SimplePipeline, Debug)
 				<< "Adjusting bufferCount from " << bufferCount
@@ -1845,7 +1849,7 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
 	inputCfg.pixelFormat = videoFormat.toPixelFormat();
 	inputCfg.size = pipeConfig->captureSize;
 	inputCfg.stride = captureFormat.planes[0].bpl;
-	inputCfg.bufferCount = kNumInternalBuffers;
+	inputCfg.bufferCount = data->swIsp_ ? 2 : kNumInternalBuffers;
 
 	if (data->converter_) {
 		return data->converter_->configure(inputCfg, outputCfgs);
@@ -1904,7 +1908,7 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
 		 * When using the converter allocate a fixed number of internal
 		 * buffers.
 		 */
-		ret = video->allocateBuffers(kNumInternalBuffers,
+		ret = video->allocateBuffers(data->swIsp_ ? 2 : kNumInternalBuffers,
 					     &data->conversionBuffers_);
 	} else {
 		/*
