@@ -402,9 +402,9 @@ void SwStatsCpu::startFrame(uint32_t frame)
  *
  * This may only be called after a successful setWindow() call.
  */
-void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId, bool frameValid)
 {
-	bool valid = frame % kStatPerNumFrames == 0;
+	bool valid = frameValid && frame % kStatPerNumFrames == 0;
 
 	if (valid) {
 		sharedStats_->sum_ = RGB<uint64_t>({ 0, 0, 0 });

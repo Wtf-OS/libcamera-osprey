@@ -10,6 +10,7 @@
 #include <libcamera/base/log.h>
 
 #include <libcamera/camera.h>
+#include <libcamera/logging.h>
 #include <libcamera/property_ids.h>
 
 #include "camera_device.h"
@@ -46,6 +47,10 @@ CameraHalManager *CameraHalManager::instance()
 
 int CameraHalManager::init()
 {
+#ifdef __ANDROID__
+    // Android syslog reaches logcat; provider stderr is discarded.
+    logSetTarget(LoggingTargetSyslog);
+#endif
 	cameraManager_ = std::make_unique<CameraManager>();
 
 	/*

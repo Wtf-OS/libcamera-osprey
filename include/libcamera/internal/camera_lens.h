@@ -28,6 +28,7 @@ public:
 
 	int init();
 	void close();
+	bool isOpen() const;
 	int setFocusPosition(int32_t position);
 
 	const std::string &model() const { return model_; }

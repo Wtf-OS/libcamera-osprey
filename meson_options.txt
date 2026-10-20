@@ -131,3 +131,6 @@ option('v4l2',
         value : 'auto',
         description : 'Compile the V4L2 compatibility layer',
         deprecated : {'true': 'enabled', 'false': 'disabled'})
+
+option('softisp-raw64-compiler', type : 'string', value : '',
+       description : 'AArch64 static compiler for the ARM32 RAW10 photo helper')

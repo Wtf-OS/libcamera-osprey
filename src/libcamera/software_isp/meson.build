@@ -40,3 +40,17 @@ if mesa_works
 endif
 
 libcamera_deps += dependency('libyuv')
+
+raw64_compiler = get_option('softisp-raw64-compiler')
+if raw64_compiler != ''
+    raw64_cpp = find_program(raw64_compiler, required : true)
+    raw64_worker = custom_target('raw64_worker',
+        input : files('raw64/raw-abi-worker.cpp'),
+        depend_files : files('raw64/raw-abi-protocol.h', 'raw64/raw-abi-render.h',
+                             'raw64/raw-abi-engine-generated.h', 'raw64/raw-abi-colour-generated.h'),
+        output : 'raw64_worker',
+        command : [raw64_cpp, '-std=c++20', '-O3', '-Wall', '-Wextra', '-Werror',
+                   '-pthread', '-static', '@INPUT@', '-o', '@OUTPUT@'],
+        install : true,
+        install_dir : get_option('libexecdir') / 'libcamera')
+endif

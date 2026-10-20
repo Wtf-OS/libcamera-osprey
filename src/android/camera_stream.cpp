@@ -7,6 +7,8 @@
 
 #include "camera_stream.h"
 
+#include <chrono>
+
 #include <errno.h>
 #include <poll.h>
 #include <string.h>
@@ -14,6 +16,8 @@
 #include <unistd.h>
 
 #include <libcamera/formats.h>
+
+#include "libcamera/internal/dma_buf_allocator.h"
 
 #include "jpeg/post_processor_jpeg.h"
 #include "yuv/post_processor_yuv.h"
@@ -168,6 +172,7 @@ int CameraStream::waitFence(int fence)
 int CameraStream::process(Camera3RequestDescriptor::StreamBuffer *streamBuffer)
 {
 	ASSERT(type_ != Type::Direct);
+	const auto prepareStart = std::chrono::steady_clock::now();
 
 	/* Handle waiting on fences on the destination buffer. */
 	if (streamBuffer->fence.isValid()) {
@@ -182,7 +187,10 @@ int CameraStream::process(Camera3RequestDescriptor::StreamBuffer *streamBuffer)
 		streamBuffer->fence.reset();
 	}
 
-	const StreamConfiguration &output = configuration();
+	const auto fenceEnd = std::chrono::steady_clock::now();
+	StreamConfiguration output = configuration();
+	output.pixelFormat = cameraDevice_->capabilities()->toPixelFormat(camera3Stream_->format);
+	output.size = Size(camera3Stream_->width, camera3Stream_->height);
 	streamBuffer->dstBuffer = std::make_unique<CameraBuffer>(
 		*streamBuffer->camera3Buffer, output.pixelFormat, output.size,
 		PROT_READ | PROT_WRITE);
@@ -191,6 +199,12 @@ int CameraStream::process(Camera3RequestDescriptor::StreamBuffer *streamBuffer)
 		return -EINVAL;
 	}
 
+	const auto mapEnd = std::chrono::steady_clock::now();
+	const auto fenceUs = std::chrono::duration_cast<std::chrono::microseconds>(fenceEnd - prepareStart).count();
+	const auto mapUs = std::chrono::duration_cast<std::chrono::microseconds>(mapEnd - fenceEnd).count();
+	if (fenceUs + mapUs > 10000)
+		LOG(HAL, Info) << "HAL output preparation took fence-us=" << fenceUs
+			<< " map-us=" << mapUs << " format=" << output.pixelFormat;
 	worker_->queueRequest(streamBuffer);
 
 	return 0;
@@ -221,9 +235,23 @@ FrameBuffer *CameraStream::getBuffer()
 		 * \todo Store a reference to the format of the source stream
 		 * instead of hardcoding.
 		 */
-		auto frameBuffer = allocator_->allocate(HAL_PIXEL_FORMAT_YCBCR_420_888,
-							configuration().size,
-							camera3Stream_->usage);
+		std::unique_ptr<FrameBuffer> frameBuffer;
+		const auto &cfg = configuration();
+		if (cfg.pixelFormat == formats::NV12) {
+			/* Shared software output is read by CPU; avoid reading write-combined GEM. */
+			DmaBufAllocator dmaAllocator(DmaBufAllocator::DmaBufAllocatorFlag::SystemHeap);
+			std::vector<std::unique_ptr<FrameBuffer>> frames;
+			if (!dmaAllocator.isValid() || dmaAllocator.exportBuffers(1,
+				{cfg.stride * cfg.size.height, cfg.stride * ((cfg.size.height + 1) / 2)},
+				&frames) != 1)
+				return nullptr;
+			frameBuffer = std::move(frames[0]);
+		} else {
+			frameBuffer = allocator_->allocate(HAL_PIXEL_FORMAT_YCBCR_420_888,
+							cfg.size, camera3Stream_->usage);
+		}
+		if (!frameBuffer)
+			return nullptr;
 		allocatedBuffers_.push_back(std::move(frameBuffer));
 		buffers_.emplace_back(allocatedBuffers_.back().get());
 	}

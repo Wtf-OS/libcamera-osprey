@@ -10,6 +10,7 @@
 #include <libcamera/base/log.h>
 
 #include <libcamera/formats.h>
+#include <libyuv/scale.h>
 
 #include "libcamera/internal/mapped_framebuffer.h"
 
@@ -22,12 +23,14 @@ Thumbnailer::Thumbnailer()
 {
 }
 
-void Thumbnailer::configure(const Size &sourceSize, PixelFormat pixelFormat)
+void Thumbnailer::configure(const Size &sourceSize, PixelFormat pixelFormat, unsigned int stride)
 {
+	valid_ = false;
+	stride_ = stride;
 	sourceSize_ = sourceSize;
 	pixelFormat_ = pixelFormat;
 
-	if (pixelFormat_ != formats::NV12) {
+	if (pixelFormat_ != formats::NV12 || stride_ < sourceSize.width) {
 		LOG(Thumbnailer, Error)
 			<< "Failed to configure: Pixel Format "
 			<< pixelFormat_ << " unsupported.";
@@ -54,43 +57,28 @@ void Thumbnailer::createThumbnail(const FrameBuffer &source,
 		return;
 	}
 
-	const unsigned int sw = sourceSize_.width;
-	const unsigned int sh = sourceSize_.height;
 	const unsigned int tw = targetSize.width;
 	const unsigned int th = targetSize.height;
+	if (!tw || !th || (tw | th) & 1) {
+		LOG(Thumbnailer, Error) << "Invalid NV12 thumbnail size " << targetSize;
+		return;
+	}
 
 	ASSERT(frame.planes().size() == 2);
-	ASSERT(tw % 2 == 0 && th % 2 == 0);
-
-	/* Image scaling block implementing nearest-neighbour algorithm. */
-	unsigned char *src = frame.planes()[0].data();
-	unsigned char *srcC = frame.planes()[1].data();
-	unsigned char *srcCb, *srcCr;
-	unsigned char *dstY, *srcY;
-
-	size_t dstSize = (th * tw) + ((th / 2) * tw);
-	destination->resize(dstSize);
-	unsigned char *dst = destination->data();
-	unsigned char *dstC = dst + th * tw;
-
-	for (unsigned int y = 0; y < th; y += 2) {
-		unsigned int sourceY = (sh * y + th / 2) / th;
-
-		dstY = dst + y * tw;
-		srcY = src + sw * sourceY;
-		srcCb = srcC + (sourceY / 2) * sw + 0;
-		srcCr = srcC + (sourceY / 2) * sw + 1;
-
-		for (unsigned int x = 0; x < tw; x += 2) {
-			unsigned int sourceX = (sw * x + tw / 2) / tw;
-
-			dstY[x] = srcY[sourceX];
-			dstY[tw + x] = srcY[sw + sourceX];
-			dstY[x + 1] = srcY[sourceX + 1];
-			dstY[tw + x + 1] = srcY[sw + sourceX + 1];
-
-			dstC[(y / 2) * tw + x + 0] = srcCb[(sourceX / 2) * 2];
-			dstC[(y / 2) * tw + x + 1] = srcCr[(sourceX / 2) * 2];
-		}
+	const Size crop = sourceSize_.boundedToAspectRatio(targetSize).alignedDownTo(2, 2);
+	if (!crop.width || !crop.height)
+		return;
+	const unsigned int x = ((sourceSize_.width - crop.width) / 2) & ~1U;
+	const unsigned int y = ((sourceSize_.height - crop.height) / 2) & ~1U;
+	destination->resize(tw * th * 3 / 2);
+	const int ret = libyuv::NV12Scale(
+		frame.planes()[0].data() + y * stride_ + x, stride_,
+		frame.planes()[1].data() + (y / 2) * stride_ + x, stride_,
+		crop.width, crop.height, destination->data(), tw,
+		destination->data() + tw * th, tw, tw, th, libyuv::kFilterBilinear);
+	if (ret) {
+		LOG(Thumbnailer, Error) << "Failed NV12 thumbnail scaling: " << ret;
+		destination->clear();
 	}
+
 }

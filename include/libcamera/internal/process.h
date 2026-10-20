@@ -38,6 +38,7 @@ public:
 	int exitCode() const { return exitCode_; }
 
 	void kill();
+	int waitForExit(int timeoutMs);
 
 	Signal<enum ExitStatus, int> finished;
 

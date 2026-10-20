@@ -872,6 +872,7 @@ int CameraCapabilities::initializeStaticMetadata()
 		ANDROID_JPEG_THUMBNAIL_QUALITY,
 		ANDROID_JPEG_THUMBNAIL_SIZE,
 		ANDROID_LENS_APERTURE,
+		ANDROID_LENS_FOCAL_LENGTH,
 		ANDROID_LENS_OPTICAL_STABILIZATION_MODE,
 		ANDROID_NOISE_REDUCTION_MODE,
 		ANDROID_SCALER_CROP_REGION,
@@ -977,8 +978,14 @@ int CameraCapabilities::initializeStaticMetadata()
 	std::vector<uint8_t> availableAfModes = {
 		ANDROID_CONTROL_AF_MODE_OFF,
 	};
-	if (controlsInfo.count(&controls::AfMode))
+	if (controlsInfo.count(&controls::AfMode)) {
 		availableAfModes.push_back(ANDROID_CONTROL_AF_MODE_AUTO);
+		if (controlsInfo.count(&controls::AfPause) &&
+		    controlsInfo.at(&controls::AfMode).max().get<int32_t>() >= controls::AfModeContinuous) {
+			availableAfModes.push_back(ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+			availableAfModes.push_back(ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+		}
+	}
 	staticMetadata_->addEntry(ANDROID_CONTROL_AF_AVAILABLE_MODES,
 				  availableAfModes);
 
@@ -1262,9 +1269,18 @@ int CameraCapabilities::initializeStaticMetadata()
 				  flashAvailable);
 
 	/* Lens static metadata. */
-	std::vector<float> lensApertures = {
-		2.53 / 100,
-	};
+	float lensAperture = 2.53 / 100;
+	float lensFocalLength = 1.0;
+	const auto sensorModel = properties.get(properties::Model);
+	// Optics from the osprey stock sensor libraries' default_lens_info records.
+	if (sensorModel == "s5k3m2") {
+		lensAperture = 2.0;
+		lensFocalLength = 3.64;
+	} else if (sensorModel == "s5k5e2") {
+		lensAperture = 2.2;
+		lensFocalLength = 2.471;
+	}
+	std::vector<float> lensApertures = { lensAperture };
 	staticMetadata_->addEntry(ANDROID_LENS_INFO_AVAILABLE_APERTURES,
 				  lensApertures);
 
@@ -1283,9 +1299,7 @@ int CameraCapabilities::initializeStaticMetadata()
 	}
 	staticMetadata_->addEntry(ANDROID_LENS_FACING, lensFacing);
 
-	std::vector<float> lensFocalLengths = {
-		1,
-	};
+	std::vector<float> lensFocalLengths = { lensFocalLength };
 	staticMetadata_->addEntry(ANDROID_LENS_INFO_AVAILABLE_FOCAL_LENGTHS,
 				  lensFocalLengths);
 
@@ -1618,8 +1632,10 @@ std::unique_ptr<CameraMetadata> CameraCapabilities::requestTemplatePreview() con
 	uint8_t controlMode = ANDROID_CONTROL_MODE_AUTO;
 	requestTemplate->addEntry(ANDROID_CONTROL_MODE, controlMode);
 
-	float lensAperture = 2.53 / 100;
-	requestTemplate->addEntry(ANDROID_LENS_APERTURE, lensAperture);
+	if (staticMetadata_->getEntry(ANDROID_LENS_INFO_AVAILABLE_APERTURES, &entry) && entry.count)
+		requestTemplate->addEntry(ANDROID_LENS_APERTURE, entry.data.f, 1);
+	if (staticMetadata_->getEntry(ANDROID_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, &entry) && entry.count)
+		requestTemplate->addEntry(ANDROID_LENS_FOCAL_LENGTH, entry.data.f, 1);
 
 	uint8_t opticalStabilization = ANDROID_LENS_OPTICAL_STABILIZATION_MODE_OFF;
 	requestTemplate->addEntry(ANDROID_LENS_OPTICAL_STABILIZATION_MODE,
@@ -1651,10 +1667,14 @@ std::unique_ptr<CameraMetadata> CameraCapabilities::requestTemplateVideo() const
 	if (!previewTemplate)
 		return nullptr;
 
-	/*
-	 * The video template requires a fixed FPS range. Everything else
-	 * stays the same as the preview template.
-	 */
+	if (camera_->controls().count(&controls::AfMode) &&
+	    camera_->controls().count(&controls::AfPause) &&
+	    camera_->controls().at(&controls::AfMode).max().get<int32_t>() >= controls::AfModeContinuous) {
+		const uint8_t afMode = ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+		previewTemplate->updateEntry(ANDROID_CONTROL_AF_MODE, afMode);
+	}
+
+	/* The video template also requires a fixed FPS range. */
 	camera_metadata_ro_entry_t entry;
 	staticMetadata_->getEntry(ANDROID_CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES,
 				  &entry);

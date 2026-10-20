@@ -5,7 +5,9 @@
  * Software ISP Image Processing Algorithm module
  */
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <stdint.h>
 #include <sys/mman.h>
 
@@ -81,6 +83,7 @@ private:
 
 	/* Local parameter storage */
 	struct IPAContext context_;
+	bool configured_ = false;
 };
 
 IPASoftIsp::~IPASoftIsp()
@@ -186,6 +189,11 @@ int IPASoftIsp::init(const IPASettings &settings,
 
 int IPASoftIsp::configure(const IPAConfigInfo &configInfo, ControlInfoMap *ipaControls)
 {
+	const auto previousAgc = configured_ ? context_.activeState.agc : agc::ActiveState{};
+	const double previousExposureUs = configured_ ?
+		context_.configuration.agc.lineDuration.get<std::micro>() * previousAgc.automatic.exposure : 0;
+	configured_ = false;
+
 	context_.sensorInfo = configInfo.sensorInfo;
 	context_.sensorControls = configInfo.sensorControls;
 
@@ -200,6 +208,23 @@ int IPASoftIsp::configure(const IPAConfigInfo &configInfo, ControlInfoMap *ipaCo
 			return ret;
 	}
 
+	// Keep metered exposure when switching between preview and still sensor modes.
+	auto &agc = context_.activeState.agc;
+	const auto &session = context_.configuration.agc;
+	const double lineUs = session.lineDuration.get<std::micro>();
+	if (previousAgc.autoExposureEnabled && previousAgc.autoGainEnabled &&
+	    agc.autoExposureEnabled && agc.autoGainEnabled && lineUs > 0 &&
+	    std::isfinite(previousExposureUs) && previousExposureUs > 0 &&
+	    std::isfinite(previousAgc.automatic.gain) && previousAgc.automatic.gain > 0) {
+		const auto &range = context_.sensorControls.find(V4L2_CID_EXPOSURE)->second;
+		agc.automatic.exposure = static_cast<uint32_t>(std::lround(std::clamp(
+			previousExposureUs / lineUs,
+			double(range.min().get<int32_t>()), double(range.max().get<int32_t>()))));
+		agc.automatic.gain = std::clamp(previousAgc.automatic.gain,
+			double(session.minAnalogueGain), double(session.maxAnalogueGain));
+	}
+
+	configured_ = true;
 	*ipaControls = { ControlInfoMap::Map(context_.ctrlMap), controls::controls };
 
 	return 0;
@@ -207,6 +232,11 @@ int IPASoftIsp::configure(const IPAConfigInfo &configInfo, ControlInfoMap *ipaCo
 
 int IPASoftIsp::start()
 {
+	ControlList ctrls(context_.sensorControls);
+	agc::prepareControls(ctrls, context_.camHelper.get(),
+			     context_.activeState.agc.automatic.exposure,
+			     context_.activeState.agc.automatic.gain);
+	setSensorControls.emit(ctrls);
 	return 0;
 }
 

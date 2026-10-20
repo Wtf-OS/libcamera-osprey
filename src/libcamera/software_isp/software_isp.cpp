@@ -284,6 +284,11 @@ uint32_t SoftwareIsp::preferredInputStride(const PixelFormat &inputFormat, const
  * \param[out] ipaControls The IPA controls to update
  * \return 0 on success, a negative errno on failure
  */
+Rectangle SoftwareIsp::inputCrop() const
+{
+	return debayer_->inputCrop();
+}
+
 int SoftwareIsp::configure(const StreamConfiguration &inputCfg,
 			   const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
 			   const ipa::softisp::IPAConfigInfo &configInfo,

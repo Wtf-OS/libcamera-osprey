@@ -7,6 +7,9 @@
 
 #include "post_processor_yuv.h"
 
+#include <chrono>
+#include <optional>
+
 #include <libyuv/scale.h>
 
 #include <libcamera/base/log.h>
@@ -16,6 +19,7 @@
 #include <libcamera/pixel_format.h>
 
 #include "libcamera/internal/formats.h"
+#include "libcamera/internal/dma_buf_allocator.h"
 #include "libcamera/internal/mapped_framebuffer.h"
 
 using namespace libcamera;
@@ -51,6 +55,7 @@ int PostProcessorYuv::configure(const StreamConfiguration &inCfg,
 
 void PostProcessorYuv::process(Camera3RequestDescriptor::StreamBuffer *streamBuffer)
 {
+	const auto processStart = std::chrono::steady_clock::now();
 	const FrameBuffer &source = *streamBuffer->srcBuffer;
 	CameraBuffer *destination = streamBuffer->dstBuffer.get();
 
@@ -59,9 +64,11 @@ void PostProcessorYuv::process(Camera3RequestDescriptor::StreamBuffer *streamBuf
 		return;
 	}
 
+	std::optional<DmaSyncer> sourceSync{std::in_place, source.planes()[0].fd, DmaSyncer::SyncType::Read};
 	const MappedFrameBuffer sourceMapped(&source, MappedFrameBuffer::MapFlag::Read);
 	if (!sourceMapped.isValid()) {
 		LOG(YUV, Error) << "Failed to mmap camera frame buffer";
+		sourceSync.reset();
 		processComplete.emit(streamBuffer, PostProcessor::Status::Error);
 		return;
 	}
@@ -80,10 +87,16 @@ void PostProcessorYuv::process(Camera3RequestDescriptor::StreamBuffer *streamBuf
 				    libyuv::FilterMode::kFilterBilinear);
 	if (ret) {
 		LOG(YUV, Error) << "Failed NV12 scaling: " << ret;
+		sourceSync.reset();
 		processComplete.emit(streamBuffer, PostProcessor::Status::Error);
 		return;
 	}
 
+	const auto processUs = std::chrono::duration_cast<std::chrono::microseconds>(
+		std::chrono::steady_clock::now() - processStart).count();
+	if (processUs > 10000)
+		LOG(YUV, Info) << "YUV output processing took us=" << processUs;
+	sourceSync.reset();
 	processComplete.emit(streamBuffer, PostProcessor::Status::Success);
 }
 

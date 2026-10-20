@@ -8,8 +8,10 @@
 #include "libcamera/internal/process.h"
 
 #include <algorithm>
+#include <chrono>
 #include <dirent.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -165,6 +167,8 @@ int Process::start(const std::string &path,
 	}
 
 	if (childPid) {
+		exitStatus_ = NotExited;
+		exitCode_ = 0;
 		pid_ = childPid;
 		pidfd_ = UniqueFD(pidfd);
 		pidfdNotify_ = std::make_unique<EventNotifier>(pidfd_.get(), EventNotifier::Type::Read);
@@ -176,6 +180,13 @@ int Process::start(const std::string &path,
 		std::vector<int> v(fds.begin(), fds.end());
 		v.push_back(STDERR_FILENO);
 		closeAllFdsExcept(std::move(v));
+
+		/* Kept descriptors must survive exec even if their owner uses CLOEXEC. */
+		for (int fd : fds) {
+			int flags = fcntl(fd, F_GETFD);
+			if (flags < 0 || fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC) < 0)
+				_exit(EXIT_FAILURE);
+		}
 
 		const auto tryDevNullLowestFd = [](int expected, int oflag) {
 			int fd = open("/dev/null", oflag);
@@ -225,7 +236,12 @@ void Process::onPidfdNotify()
 	 * `static_cast` is needed because `P_PIDFD` is not defined in `sys/wait.h` if the C standard library
 	 * is old enough. So `P_PIDFD` is taken from `linux/wait.h`, where it is just an integer #define.
 	 */
-	if (waitid(static_cast<idtype_t>(P_PIDFD), pidfd.get(), &info, WNOHANG | WEXITED) >= 0) {
+	int ret;
+	do {
+		ret = waitid(static_cast<idtype_t>(P_PIDFD), pidfd.get(), &info, WNOHANG | WEXITED);
+	} while (ret < 0 && errno == EINTR);
+
+	if (ret >= 0) {
 		ASSERT(info.si_pid == pid);
 
 		LOG(Process, Debug)
@@ -243,6 +259,50 @@ void Process::onPidfdNotify()
 			<< this << "[" << pid << ":" << pidfd.get() << "]"
 			<< " waitid() failed: " << strerror(err);
 	}
+}
+
+/**
+ * \brief Wait synchronously for process termination in its owner's thread
+ * \param[in] timeoutMs Maximum wait in milliseconds, zero to poll
+ *
+ * No events are dispatched while waiting. A timeout leaves the process and its
+ * notification active; only a zero return permits reuse of shared buffers.
+ *
+ * \return Zero if the process has exited or was never started, -ETIMEDOUT if
+ * still running at the deadline, or another negative error code
+ */
+int Process::waitForExit(int timeoutMs)
+{
+	if (timeoutMs < 0)
+		return -EINVAL;
+	if (!pidfd_.isValid())
+		return 0;
+
+	using namespace std::chrono;
+	const auto deadline = steady_clock::now() + milliseconds(timeoutMs);
+	const bool enabled = pidfdNotify_->enabled();
+	pidfdNotify_->setEnabled(false);
+	pollfd descriptor{ pidfd_.get(), POLLIN, 0 };
+	int ret;
+	for (;;) {
+		const auto remaining = std::max(ceil<milliseconds>(deadline - steady_clock::now()), 0ms);
+		ret = poll(&descriptor, 1, remaining.count());
+		if (ret >= 0 || errno != EINTR)
+			break;
+		if (steady_clock::now() >= deadline) {
+			ret = 0;
+			break;
+		}
+	}
+
+	if (ret > 0 && (descriptor.revents & POLLIN)) {
+		onPidfdNotify();
+		return 0;
+	}
+
+	const int error = ret < 0 ? -errno : ret ? -EIO : -ETIMEDOUT;
+	pidfdNotify_->setEnabled(enabled);
+	return error;
 }
 
 /**

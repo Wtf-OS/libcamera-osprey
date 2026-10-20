@@ -25,6 +25,7 @@
 #include <libcamera/base/shared_fd.h>
 
 #include <libcamera/framebuffer.h>
+#include "libcamera/internal/framebuffer.h"
 
 /**
  * \file dma_buf_allocator.cpp
@@ -259,7 +260,9 @@ DmaBufAllocator::createBuffer(std::string name,
 		offset += planeSize;
 	}
 
-	return std::make_unique<FrameBuffer>(planes);
+	auto buffer = std::make_unique<FrameBuffer>(planes);
+	buffer->_d()->setCpuCached(type_ == DmaBufAllocatorFlag::SystemHeap);
+	return buffer;
 }
 
 /**

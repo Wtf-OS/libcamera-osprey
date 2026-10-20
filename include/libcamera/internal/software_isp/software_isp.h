@@ -63,6 +63,7 @@ public:
 	strideAndFrameSize(const PixelFormat &outputFormat, const Size &size);
 	uint32_t preferredInputStride(const PixelFormat &inputFormat, const Size &size);
 
+	Rectangle inputCrop() const;
 	int configure(const StreamConfiguration &inputCfg,
 		      const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
 		      const ipa::softisp::IPAConfigInfo &configInfo,

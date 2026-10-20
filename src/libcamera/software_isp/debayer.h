@@ -38,6 +38,7 @@ public:
 	Debayer(const CameraManager &cm);
 	virtual ~Debayer() = 0;
 
+	virtual Rectangle inputCrop() const = 0;
 	virtual int configure(const StreamConfiguration &inputCfg,
 			      const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
 			      bool ccmEnabled) = 0;

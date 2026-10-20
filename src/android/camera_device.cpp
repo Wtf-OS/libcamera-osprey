@@ -747,7 +747,11 @@ int CameraDevice::configureStreams(camera3_stream_configuration_t *stream_list)
 			streamConfigs.erase(streamConfigs.begin() + i);
 		}
 	}
-	for (const auto &streamConfig : streamConfigs) {
+	for (auto &streamConfig : streamConfigs) {
+		const auto yuvStreams = std::count_if(streamConfig.streams.begin(), streamConfig.streams.end(),
+			[](const auto &stream) { return stream.stream->format != HAL_PIXEL_FORMAT_BLOB; });
+		if (streamConfig.config.pixelFormat == formats::NV12 && yuvStreams > 1)
+			streamConfig.streams[0].type = CameraStream::Type::Internal;
 		config->addConfiguration(streamConfig.config);
 
 		CameraStream *sourceStream = nullptr;
@@ -765,7 +769,8 @@ int CameraDevice::configureStreams(camera3_stream_configuration_t *stream_list)
 			 * be used when constructing the subsequent mapped
 			 * streams.
 			 */
-			if (stream.type == CameraStream::Type::Direct)
+			if (stream.type == CameraStream::Type::Direct ||
+			    stream.type == CameraStream::Type::Internal)
 				sourceStream = &streams_.back();
 		}
 	}
@@ -850,6 +855,16 @@ int CameraDevice::processControls(Camera3RequestDescriptor *descriptor)
 	/* Translate the Android request settings to libcamera controls. */
 	ControlList &controls = descriptor->request_->controls();
 	camera_metadata_ro_entry_t entry;
+    if (camera_->controls().count(&controls::FrameDurationLimits) &&
+        settings.getEntry(ANDROID_CONTROL_AE_TARGET_FPS_RANGE, &entry)) {
+        if (entry.count != 2 || entry.data.i32[0] <= 0 ||
+            entry.data.i32[1] < entry.data.i32[0] || entry.data.i32[1] > 1000000)
+            return -EINVAL;
+        const std::array<int64_t, 2> durations = {
+            1000000LL / entry.data.i32[1], 1000000LL / entry.data.i32[0]
+        };
+        controls.set(controls::FrameDurationLimits, std::span<const int64_t, 2>(durations));
+    }
     if (camera_->controls().count(&controls::draft::OspreyFlashMode)) {
         int mode = 0;
         if (settings.getEntry(ANDROID_FLASH_MODE, &entry)) {
@@ -893,18 +908,42 @@ int CameraDevice::processControls(Camera3RequestDescriptor *descriptor)
         }
     }
     if (camera_->controls().count(&controls::AfMode)) {
+        uint8_t requestedAfMode = ANDROID_CONTROL_AF_MODE_OFF;
         if (settings.getEntry(ANDROID_CONTROL_AF_MODE, &entry)) {
-            if (*entry.data.u8 != ANDROID_CONTROL_AF_MODE_OFF &&
-                *entry.data.u8 != ANDROID_CONTROL_AF_MODE_AUTO)
+            if (entry.count != 1)
                 return -EINVAL;
-            controls.set(controls::AfMode, *entry.data.u8 == ANDROID_CONTROL_AF_MODE_OFF ?
-                controls::AfModeManual : controls::AfModeAuto);
+            requestedAfMode = *entry.data.u8;
+            switch (requestedAfMode) {
+            case ANDROID_CONTROL_AF_MODE_OFF:
+                controls.set(controls::AfMode, controls::AfModeManual);
+                break;
+            case ANDROID_CONTROL_AF_MODE_AUTO:
+                controls.set(controls::AfMode, controls::AfModeAuto);
+                break;
+            case ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO:
+            case ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE:
+                if (!camera_->controls().count(&controls::AfPause) ||
+                    camera_->controls().at(&controls::AfMode).max().get<int32_t>() < controls::AfModeContinuous)
+                    return -EINVAL;
+                controls.set(controls::AfMode, controls::AfModeContinuous);
+                break;
+            default:
+                return -EINVAL;
+            }
         }
         if (settings.getEntry(ANDROID_CONTROL_AF_TRIGGER, &entry)) {
-            if (*entry.data.u8 == ANDROID_CONTROL_AF_TRIGGER_START)
+            if (entry.count != 1)
+                return -EINVAL;
+            if (*entry.data.u8 == ANDROID_CONTROL_AF_TRIGGER_START) {
                 controls.set(controls::AfTrigger, controls::AfTriggerStart);
-            else if (*entry.data.u8 == ANDROID_CONTROL_AF_TRIGGER_CANCEL)
+                if (camera_->controls().count(&controls::AfPause))
+                    controls.set(controls::AfPause, requestedAfMode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO ?
+                        controls::AfPauseImmediate : controls::AfPauseDeferred);
+            } else if (*entry.data.u8 == ANDROID_CONTROL_AF_TRIGGER_CANCEL) {
                 controls.set(controls::AfTrigger, controls::AfTriggerCancel);
+                if (camera_->controls().count(&controls::AfPause))
+                    controls.set(controls::AfPause, controls::AfPauseResume);
+            }
         }
     }
     if (settings.getEntry(ANDROID_SCALER_CROP_REGION, &entry)) {
@@ -915,7 +954,8 @@ int CameraDevice::processControls(Camera3RequestDescriptor *descriptor)
 		controls.set(controls::ScalerCrop, cropRegion);
 	}
 
-	if (settings.getEntry(ANDROID_STATISTICS_FACE_DETECT_MODE, &entry)) {
+	if (camera_->controls().find(&controls::draft::FaceDetectMode) != camera_->controls().end() &&
+        settings.getEntry(ANDROID_STATISTICS_FACE_DETECT_MODE, &entry)) {
 		const uint8_t *data = entry.data.u8;
 		controls.set(controls::draft::FaceDetectMode, data[0]);
 	}
@@ -1177,6 +1217,8 @@ int CameraDevice::processCaptureRequest(camera3_capture_request_t *camera3Reques
 		 * for this stream.
 		 */
 		FrameBuffer *frameBuffer = cameraStream->getBuffer();
+		if (!frameBuffer)
+			return -ENOMEM;
 		buffer.internalBuffer = frameBuffer;
 
 		descriptor->request_->addBuffer(sourceStream->stream(),
@@ -1318,6 +1360,15 @@ void CameraDevice::requestComplete(Request *request)
 	/* Handle post-processing. */
 	MutexLocker locker(descriptor->streamsProcessMutex_);
 
+	/* A completed request can still contain a failed or cancelled frame. */
+	for (auto &buffer : descriptor->buffers_) {
+		FrameBuffer *frame = request->findBuffer(buffer.stream->stream());
+		if (!frame || frame->metadata().status != FrameMetadata::FrameSuccess) {
+			setBufferStatus(buffer, Camera3RequestDescriptor::Status::Error);
+			descriptor->pendingStreamsToProcess_.erase(buffer.stream);
+		}
+	}
+
 	/*
 	 * Queue all the post-processing streams request at once. The completion
 	 * slot streamProcessingComplete() can only execute when we are out
@@ -1345,12 +1396,6 @@ void CameraDevice::requestComplete(Request *request)
 			setBufferStatus(*buffer, Camera3RequestDescriptor::Status::Error);
 			descriptor->pendingStreamsToProcess_.erase(stream);
 
-			/*
-			 * If the framebuffer is internal to CameraStream return
-			 * it back now that we're done processing it.
-			 */
-			if (buffer->internalBuffer)
-				stream->putBuffer(buffer->internalBuffer);
 		}
 	}
 
@@ -1410,6 +1455,11 @@ void CameraDevice::sendCaptureResults()
 		resultBuffers.reserve(descriptor->buffers_.size());
 
 		for (auto &buffer : descriptor->buffers_) {
+			/* Mapped streams must finish reading before the shared buffer is recycled. */
+			if (buffer.internalBuffer) {
+				buffer.stream->putBuffer(buffer.internalBuffer);
+				buffer.internalBuffer = nullptr;
+			}
 			camera3_buffer_status status = CAMERA3_BUFFER_STATUS_ERROR;
 
 			if (buffer.status == Camera3RequestDescriptor::Status::Success)
@@ -1470,12 +1520,6 @@ void CameraDevice::streamProcessingComplete(Camera3RequestDescriptor::StreamBuff
 {
 	setBufferStatus(*streamBuffer, status);
 
-	/*
-	 * If the framebuffer is internal to CameraStream return it back now
-	 * that we're done processing it.
-	 */
-	if (streamBuffer->internalBuffer)
-		streamBuffer->stream->putBuffer(streamBuffer->internalBuffer);
 
 	Camera3RequestDescriptor *request = streamBuffer->request;
 
@@ -1580,11 +1624,7 @@ CameraDevice::getResultMetadata(const Camera3RequestDescriptor &descriptor) cons
 	resultMetadata->addEntry(ANDROID_CONTROL_AE_MODE, value);
 
 	if (settings.getEntry(ANDROID_CONTROL_AE_TARGET_FPS_RANGE, &entry))
-		/*
-		 * \todo Retrieve the AE FPS range from the libcamera metadata.
-		 * As libcamera does not support that control, as a temporary
-		 * workaround return what the framework asked.
-		 */
+		/* Report the requested AE policy; sensor frame duration reports actual timing. */
 		resultMetadata->addEntry(ANDROID_CONTROL_AE_TARGET_FPS_RANGE,
 					 entry.data.i32, 2);
 
@@ -1596,23 +1636,39 @@ CameraDevice::getResultMetadata(const Camera3RequestDescriptor &descriptor) cons
 	value = ANDROID_CONTROL_AE_STATE_CONVERGED;
 	resultMetadata->addEntry(ANDROID_CONTROL_AE_STATE, value);
 
-	value = metadata.get(controls::AfMode).value_or(controls::AfModeManual) == controls::AfModeAuto ?
-        ANDROID_CONTROL_AF_MODE_AUTO : ANDROID_CONTROL_AF_MODE_OFF;
-	resultMetadata->addEntry(ANDROID_CONTROL_AF_MODE, value);
+    const int afMode = metadata.get(controls::AfMode).value_or(controls::AfModeManual);
+    value = afMode == controls::AfModeAuto ? ANDROID_CONTROL_AF_MODE_AUTO :
+        afMode == controls::AfModeContinuous ? ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE : ANDROID_CONTROL_AF_MODE_OFF;
+    if (camera_->controls().count(&controls::AfMode) && settings.getEntry(ANDROID_CONTROL_AF_MODE, &entry) && entry.count == 1)
+        value = *entry.data.u8;
+    resultMetadata->addEntry(ANDROID_CONTROL_AF_MODE, value);
+    const bool continuousAf = value == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE ||
+                              value == ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+    const bool lockedAf = metadata.get(controls::AfPauseState).value_or(controls::AfPauseStateRunning) == controls::AfPauseStatePaused;
 
-	value = ANDROID_CONTROL_AF_STATE_INACTIVE;
-    if (auto state = metadata.get(controls::AfState)) {
-        switch (*state) {
-        case controls::AfStateScanning: value = ANDROID_CONTROL_AF_STATE_ACTIVE_SCAN; break;
-        case controls::AfStateFocused: value = ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED; break;
-        case controls::AfStateFailed: value = ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED; break;
-        default: break;
+    const bool autofocus = value != ANDROID_CONTROL_AF_MODE_OFF;
+    value = ANDROID_CONTROL_AF_STATE_INACTIVE;
+    if (autofocus) {
+        const int state = metadata.get(controls::AfState).value_or(controls::AfStateIdle);
+        if (continuousAf && !lockedAf) {
+            switch (state) {
+            case controls::AfStateScanning: value = ANDROID_CONTROL_AF_STATE_PASSIVE_SCAN; break;
+            case controls::AfStateFocused: value = ANDROID_CONTROL_AF_STATE_PASSIVE_FOCUSED; break;
+            case controls::AfStateFailed: value = ANDROID_CONTROL_AF_STATE_PASSIVE_UNFOCUSED; break;
+            default: break;
+            }
+        } else {
+            switch (state) {
+            case controls::AfStateScanning: value = continuousAf ? ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED : ANDROID_CONTROL_AF_STATE_ACTIVE_SCAN; break;
+            case controls::AfStateFocused: value = ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED; break;
+            case controls::AfStateFailed: value = ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED; break;
+            default: if (continuousAf && lockedAf) value = ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED; break;
+            }
         }
     }
     resultMetadata->addEntry(ANDROID_CONTROL_AF_STATE, value);
-
-	value = ANDROID_CONTROL_AF_TRIGGER_IDLE;
-	resultMetadata->addEntry(ANDROID_CONTROL_AF_TRIGGER, value);
+    value = settings.getEntry(ANDROID_CONTROL_AF_TRIGGER, &entry) && entry.count == 1 ? *entry.data.u8 : uint8_t(ANDROID_CONTROL_AF_TRIGGER_IDLE);
+    resultMetadata->addEntry(ANDROID_CONTROL_AF_TRIGGER, value);
     if (camera_->controls().count(&controls::AfWindows)) {
         if (settings.getEntry(ANDROID_CONTROL_AF_REGIONS, &entry))
             resultMetadata->addEntry(ANDROID_CONTROL_AF_REGIONS, entry.data.i32, entry.count);
@@ -1660,11 +1716,11 @@ CameraDevice::getResultMetadata(const Camera3RequestDescriptor &descriptor) cons
             ANDROID_FLASH_STATE_FIRED : ANDROID_FLASH_STATE_READY) : ANDROID_FLASH_STATE_UNAVAILABLE;
 	resultMetadata->addEntry(ANDROID_FLASH_STATE, value);
 
-	if (settings.getEntry(ANDROID_LENS_APERTURE, &entry))
+	// Both osprey lenses have fixed optics: report capabilities, not requested values.
+	if (capabilities_.staticMetadata()->getEntry(ANDROID_LENS_INFO_AVAILABLE_APERTURES, &entry) && entry.count)
 		resultMetadata->addEntry(ANDROID_LENS_APERTURE, entry.data.f, 1);
-
-	float focal_length = 1.0;
-	resultMetadata->addEntry(ANDROID_LENS_FOCAL_LENGTH, focal_length);
+	if (capabilities_.staticMetadata()->getEntry(ANDROID_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, &entry) && entry.count)
+		resultMetadata->addEntry(ANDROID_LENS_FOCAL_LENGTH, entry.data.f, 1);
 
 	value = ANDROID_LENS_STATE_STATIONARY;
 	resultMetadata->addEntry(ANDROID_LENS_STATE, value);

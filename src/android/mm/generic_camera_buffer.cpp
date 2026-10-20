@@ -7,11 +7,17 @@
 
 #include "../camera_buffer.h"
 
+#include <algorithm>
+#include <list>
+#include <memory>
+#include <tuple>
 #include <cros_gralloc_handle.h>
+#include <sys/stat.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include <libcamera/base/log.h>
+#include <libcamera/formats.h>
 
 #include "libcamera/internal/formats.h"
 #include "libcamera/internal/mapped_framebuffer.h"
@@ -19,6 +25,57 @@
 using namespace libcamera;
 
 LOG_DECLARE_CATEGORY(HAL)
+
+namespace {
+
+class PreviewMapping final : public MappedBuffer
+{
+public:
+	PreviewMapping(int fd, size_t length, int flags)
+	{
+		void *address = mmap(nullptr, length, flags, MAP_SHARED, fd, 0);
+		if (address == MAP_FAILED) {
+			error_ = -errno;
+			return;
+		}
+		maps_.emplace_back(static_cast<uint8_t *>(address), length);
+		planes_ = maps_;
+	}
+};
+
+std::shared_ptr<PreviewMapping> previewMapping(int fd, size_t length, int flags)
+{
+	struct stat identity;
+	if (fstat(fd, &identity) < 0)
+		return {};
+
+	/* Plane FDs can alias one GEM: share its full preview mapping. */
+	if (length && identity.st_size >= static_cast<off_t>(length) &&
+	    identity.st_size <= 4 * 1024 * 1024)
+		length = identity.st_size;
+
+	using Key = std::tuple<dev_t, ino_t, size_t, int>;
+	using Entry = std::pair<Key, std::shared_ptr<PreviewMapping>>;
+	static thread_local std::list<Entry> cache;
+	const Key key{identity.st_dev, identity.st_ino, length, flags};
+	auto found = std::find_if(cache.begin(), cache.end(),
+				 [&](const Entry &entry) { return entry.first == key; });
+	if (found != cache.end()) {
+		cache.splice(cache.begin(), cache, found);
+		return cache.front().second;
+	}
+
+	auto mapping = std::make_shared<PreviewMapping>(fd, length, flags);
+	if (mapping->isValid()) {
+		cache.emplace_front(key, mapping);
+		/* Bound retained views per worker; active requests own their references. */
+		if (cache.size() > 8)
+			cache.pop_back();
+	}
+	return mapping;
+}
+
+} /* namespace */
 
 class CameraBuffer::Private : public Extensible::Private,
 			      public MappedBuffer
@@ -54,6 +111,8 @@ private:
 	int flags_;
 	off_t bufferLength_;
 	bool mapped_;
+	bool retainMappings_;
+	std::vector<std::shared_ptr<PreviewMapping>> retainedMappings_;
 	std::vector<PlaneInfo> planeInfo_;
 };
 
@@ -61,7 +120,8 @@ CameraBuffer::Private::Private([[maybe_unused]] CameraBuffer *cameraBuffer,
 			       buffer_handle_t camera3Buffer,
 			       PixelFormat pixelFormat,
 			       const Size &size, int flags)
-	: fd_(-1), flags_(flags), bufferLength_(-1), mapped_(false)
+	: fd_(-1), flags_(flags), bufferLength_(-1), mapped_(false),
+	  retainMappings_(pixelFormat == formats::NV12)
 {
 	error_ = 0;
 
@@ -149,6 +209,8 @@ CameraBuffer::Private::Private([[maybe_unused]] CameraBuffer *cameraBuffer,
 
 CameraBuffer::Private::~Private()
 {
+	if (!retainedMappings_.empty() && (flags_ & PROT_WRITE))
+		__sync_synchronize();
 }
 
 unsigned int CameraBuffer::Private::numPlanes() const
@@ -194,7 +256,8 @@ size_t CameraBuffer::Private::jpegBufferSize(size_t maxJpegBufferSize) const
 {
 	ASSERT(bufferLength_ >= 0);
 
-	return std::min<unsigned int>(bufferLength_, maxJpegBufferSize);
+	// The dma-buf allocation may include padding beyond the mapped BLOB plane.
+	return planeInfo_.empty() ? 0 : std::min<size_t>(planeInfo_[0].size, maxJpegBufferSize);
 }
 
 void CameraBuffer::Private::map()
@@ -204,6 +267,18 @@ void CameraBuffer::Private::map()
 
  for (const auto &info : planeInfo_) {
   size_t length = static_cast<size_t>(info.offset) + info.size;
+  /* Retain only small writable preview mappings, not full-resolution still buffers. */
+  if (retainMappings_ && flags_ == (PROT_READ | PROT_WRITE) && bufferLength_ <= 4 * 1024 * 1024) {
+   auto mapping = previewMapping(info.fd, length, flags_);
+   if (!mapping || !mapping->isValid()) {
+    error_ = mapping ? mapping->error() : -errno;
+    LOG(HAL, Error) << "Failed to map preview plane";
+    return;
+   }
+   planes_.emplace_back(mapping->planes()[0].data() + info.offset, info.size);
+   retainedMappings_.push_back(std::move(mapping));
+   continue;
+  }
   void *address = mmap(nullptr, length, flags_, MAP_SHARED, info.fd, 0);
   if (address == MAP_FAILED) {
    error_ = -errno;

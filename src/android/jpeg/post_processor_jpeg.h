@@ -11,6 +11,8 @@
 #include "encoder_libjpeg.h"
 #include "thumbnailer.h"
 
+#include <optional>
+#include <libcamera/color_space.h>
 #include <libcamera/geometry.h>
 
 class CameraDevice;
@@ -25,7 +27,7 @@ public:
 	void process(Camera3RequestDescriptor::StreamBuffer *streamBuffer) override;
 
 private:
-	void generateThumbnail(const libcamera::FrameBuffer &source,
+	int generateThumbnail(const libcamera::FrameBuffer &source,
 			       const libcamera::Size &targetSize,
 			       unsigned int quality,
 			       std::vector<unsigned char> *thumbnail);
@@ -33,6 +35,7 @@ private:
 	CameraDevice *const cameraDevice_;
 	std::unique_ptr<Encoder> encoder_;
 	libcamera::Size streamSize_;
+	std::optional<libcamera::ColorSpace> sourceColorSpace_;
 	EncoderLibJpeg thumbnailEncoder_;
 	Thumbnailer thumbnailer_;
 };

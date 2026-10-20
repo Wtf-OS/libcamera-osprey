@@ -50,16 +50,24 @@ void CameraLens::close()
 	subdev_.reset();
 }
 
+bool CameraLens::isOpen() const
+{
+	return subdev_ && subdev_->isOpen();
+}
+
 /**
  * \brief Initialize the camera lens instance
  *
  * This function performs the initialisation steps of the CameraLens that may
- * fail. Call once after constructing the instance or after close().
+ * fail. An already initialized open lens is reused until close().
  *
  * \return 0 on success or a negative error code otherwise
  */
 int CameraLens::init()
 {
+	if (isOpen())
+		return 0;
+
 	if (entity_->function() != MEDIA_ENT_F_LENS) {
 		LOG(CameraLens, Error)
 			<< "Invalid lens function "
@@ -74,8 +82,10 @@ int CameraLens::init()
 		return ret;
 
 	ret = validateLensDriver();
-	if (ret)
+	if (ret) {
+		close();
 		return ret;
+	}
 
 	model_ = subdev_->model();
 	return 0;

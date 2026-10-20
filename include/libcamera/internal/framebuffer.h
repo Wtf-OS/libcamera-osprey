@@ -29,6 +29,8 @@ public:
 
 	void setRequest(Request *request) { request_ = request; }
 	bool isContiguous() const { return isContiguous_; }
+	bool isCpuCached() const { return cpuCached_; }
+	void setCpuCached(bool cached) { cpuCached_ = cached; }
 
 	Fence *fence() const { return fence_.get(); }
 	void setFence(std::unique_ptr<Fence> fence) { fence_ = std::move(fence); }
@@ -45,6 +47,7 @@ private:
 	std::unique_ptr<Fence> fence_;
 	Request *request_;
 	bool isContiguous_;
+	bool cpuCached_ = false;
 };
 
 } /* namespace libcamera */

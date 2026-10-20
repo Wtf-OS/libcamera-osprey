@@ -12,6 +12,7 @@
 #pragma once
 
 #include <memory>
+#include <span>
 #include <stdint.h>
 #include <vector>
 
@@ -26,9 +27,12 @@
 
 #include "debayer.h"
 
+namespace rawabi { class Client; }
+
 namespace libcamera {
 
 class DebayerCpuThread;
+class MappedFrameBuffer;
 class DebayerCpu : public Debayer
 {
 public:
@@ -38,6 +42,7 @@ public:
 	int configure(const StreamConfiguration &inputCfg,
 		      const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
 		      bool ccmEnabled) override;
+	Rectangle inputCrop() const override { return window_; }
 	Size patternSize(PixelFormat inputFormat) override;
 	std::vector<PixelFormat> formats(PixelFormat input) override;
 	std::tuple<unsigned int, unsigned int>
@@ -148,8 +153,14 @@ private:
 	bool ccmEnabled_;
 	bool nv12Output_ = false;
 	unsigned int nv12Stride_ = 0;
-	std::vector<uint8_t> rgbBuffer_;
+	std::vector<uint8_t> lumaBuffer_;
 	std::vector<uint8_t> nv12Buffer_;
+	std::unique_ptr<FrameBuffer> raw64Scratch_;
+	std::unique_ptr<MappedFrameBuffer> raw64Mapping_;
+	std::unique_ptr<rawabi::Client> raw64Client_;
+	std::span<uint8_t> nv12Pixels_;
+	int raw64Pattern_ = -1;
+	bool raw64StatsOnly_ = false;
 	bool chromaDenoise_ = false;
 	bool colourBoost_ = false;
 	bool lumaDenoise_ = false;
@@ -169,6 +180,7 @@ private:
 	static constexpr unsigned int kDefaultThreads = 2;
 
 	unsigned int workPending_ LIBCAMERA_TSA_GUARDED_BY(workPendingMutex_);
+	int conversionResult_ LIBCAMERA_TSA_GUARDED_BY(workPendingMutex_);
 	Mutex workPendingMutex_;
 	ConditionVariable workPendingCv_;
 	std::vector<std::unique_ptr<DebayerCpuThread>> threads_;

@@ -10,6 +10,7 @@
  */
 
 #include "debayer.h"
+#include "libcamera/internal/framebuffer.h"
 
 namespace libcamera {
 
@@ -283,7 +284,8 @@ void Debayer::dmaSyncBegin(std::vector<DmaSyncer> &dmaSyncers, FrameBuffer *inpu
 
 	if (output) {
 		for (const FrameBuffer::Plane &plane : output->planes())
-			dmaSyncers.emplace_back(plane.fd, DmaSyncer::SyncType::Write);
+			dmaSyncers.emplace_back(plane.fd, output->_d()->isCpuCached() ?
+                DmaSyncer::SyncType::ReadWrite : DmaSyncer::SyncType::Write);
 	}
 }
 
